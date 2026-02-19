@@ -1,5 +1,6 @@
 use std::ops::{Index, IndexMut};
 
+use ark_ff::FftField;
 use ark_ff::PrimeField;
 use ark_poly::EvaluationDomain;
 use ark_poly::GeneralEvaluationDomain;
@@ -156,6 +157,7 @@ impl<
         pk: &ark_groth16::ProvingKey<P>,
         num_constraints: usize,
         num_instance_variables: usize,
+        eval_c: bool,
     ) -> Self {
         let alpha_g1 = ark_to_icicle_affine(&pk.vk.alpha_g1);
         let beta_g2 = ark_to_icicle_affine(&pk.vk.beta_g2);
@@ -201,7 +203,11 @@ impl<
         let domain_size = domain.size();
         let power = domain_size.ilog2() as usize;
 
-        let root_of_unity = root_of_unity_for_groth16::<P::ScalarField>(power, &mut domain);
+        let root_of_unity = if eval_c {
+            P::ScalarField::GENERATOR
+        } else {
+            root_of_unity_for_groth16::<P::ScalarField>(power, &mut domain)
+        };
         let root_of_unity = ark_to_icicle_scalar(root_of_unity);
         let mut roots = Vec::with_capacity(domain_size);
         let mut c = F::one();
@@ -243,10 +249,12 @@ pub(crate) fn initialize_domain<F: FieldImpl<Config: NTTDomain<F>>>(max_size: us
 pub(crate) fn fft_inplace<F: FieldImpl<Config: VecOps<F> + NTT<F, F>>>(
     input: &mut DeviceSlice<F>,
     stream: &IcicleStream,
+    coset_gen: Option<F>,
 ) {
     let mut ntt_config = NTTConfig::<F>::default();
     ntt_config.stream_handle = **stream;
     ntt_config.is_async = true;
+    ntt_config.coset_gen = coset_gen.unwrap_or_else(|| F::one());
 
     ntt_inplace(input, NTTDir::kForward, &ntt_config).expect("Failed to compute FFT in place");
 }
@@ -254,10 +262,12 @@ pub(crate) fn fft_inplace<F: FieldImpl<Config: VecOps<F> + NTT<F, F>>>(
 pub(crate) fn ifft_inplace<F: FieldImpl<Config: VecOps<F> + NTT<F, F>>>(
     input: &mut DeviceSlice<F>,
     stream: &IcicleStream,
+    coset_gen: Option<F>,
 ) {
     let mut ntt_config = NTTConfig::<F>::default();
     ntt_config.stream_handle = **stream;
     ntt_config.is_async = true;
+    ntt_config.coset_gen = coset_gen.unwrap_or_else(|| F::one());
 
     ntt_inplace(input, NTTDir::kInverse, &ntt_config)
         .expect("Failed to compute inverse FFT in place");
@@ -271,17 +281,20 @@ pub(crate) fn msm_async<
     scalars: &DeviceSlice<F>,
     stream: &IcicleStream,
 ) -> DeviceVec<Projective<C>> {
-    println!(
-        "Starting MSM with {} points and {} scalars",
-        points.len(),
-        scalars.len()
-    );
+    let size = std::cmp::min(points.len(), scalars.len());
+
     let mut results: DeviceVec<Projective<C>> =
         DeviceVec::device_malloc_async(1, stream).expect("Failed to allocate device vector");
     let mut cfg = MSMConfig::default();
     cfg.stream_handle = **stream;
     cfg.is_async = true;
 
-    msm::<C>(scalars, points, &cfg, results.index_mut(..)).expect("Failed to compute MSM");
+    msm::<C>(
+        &scalars[..size],
+        &points[..size],
+        &cfg,
+        results.index_mut(..),
+    )
+    .expect("Failed to compute MSM");
     results
 }

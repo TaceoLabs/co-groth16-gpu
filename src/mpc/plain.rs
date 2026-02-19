@@ -1,5 +1,3 @@
-use std::{mem::transmute, ops::IndexMut};
-
 use ark_ff::UniformRand;
 use icicle_core::{
     curve::{Affine, Curve},
@@ -14,10 +12,11 @@ use icicle_runtime::{
 use mpc_core::MpcState;
 use mpc_net::Network;
 use rand::thread_rng;
+use std::{mem::transmute, ops::IndexMut};
 
 use crate::{
-    bridges::{ArkIcicleBridge, ark_to_icicle_scalar, ark_to_icicle_scalars},
-    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace},
+    bridges::{ArkIcicleBridge, ark_to_icicle_scalar, ark_to_icicle_scalars, icicle_to_ark_scalar},
+    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
 };
 
 use super::CircomGroth16Prover;
@@ -79,12 +78,12 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         *a = (a.to_projective() + b.to_projective()).into();
     }
 
-    fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream) {
-        fft_inplace(input, stream);
+    fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
+        fft_inplace(input, stream, coset_gen);
     }
 
-    fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream) {
-        ifft_inplace(input, stream);
+    fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
+        ifft_inplace(input, stream, coset_gen);
     }
 
     fn copy_to_device_shares(
@@ -111,6 +110,26 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
             unsafe { transmute::<&Vec<T::ArithmeticShare>, &Vec<B::ArkScalarField>>(shares) };
+
+        let shares_icicle = from_host_slice(shares);
+        ark_to_icicle_scalars(shares_icicle).unwrap()
+    }
+
+    fn half_shares_to_device<
+        B: ArkIcicleBridge<IcicleScalarField = F>,
+        T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        shares: &Vec<T::ArithmeticHalfShare>,
+    ) -> Self::DeviceShares {
+        if std::any::TypeId::of::<T>()
+            != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
+        {
+            panic!("Invalid driver: expected PlainGroth16Driver");
+        }
+
+        // SAFETY: At this point we know the shares are safe to transmute
+        let shares =
+            unsafe { transmute::<&Vec<T::ArithmeticHalfShare>, &Vec<B::ArkScalarField>>(shares) };
 
         let shares_icicle = from_host_slice(shares);
         ark_to_icicle_scalars(shares_icicle).unwrap()
@@ -172,5 +191,27 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Affine<B::IcicleG1>> {
         Ok((a.to_projective() * b).into())
+    }
+
+    fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        shares: &Self::DeviceShares,
+        _: &N,
+        _: &mut Self::State,
+    ) -> eyre::Result<Vec<B::ArkScalarField>> {
+        Ok(to_host_vec_icicle_scalar(shares)
+            .into_iter()
+            .map(icicle_to_ark_scalar)
+            .collect::<Vec<_>>())
+    }
+
+    fn open_device_half_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        shares: &DeviceVec<F>,
+        _: &N,
+        _: &mut Self::State,
+    ) -> eyre::Result<Vec<B::ArkScalarField>> {
+        Ok(to_host_vec_icicle_scalar(shares)
+            .into_iter()
+            .map(icicle_to_ark_scalar)
+            .collect::<Vec<_>>())
     }
 }

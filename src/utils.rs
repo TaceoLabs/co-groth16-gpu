@@ -60,7 +60,10 @@ pub(crate) fn root_of_unity_for_groth16<F: PrimeField + FftField>(
     }
 }
 
-pub(crate) fn evaluate_constraint<P: ark_ec::pairing::Pairing, T: co_groth16::CircomGroth16Prover<P>>(
+pub(crate) fn evaluate_constraint<
+    P: ark_ec::pairing::Pairing,
+    T: co_groth16::CircomGroth16Prover<P>,
+>(
     id: <T::State as MpcState>::PartyID,
     domain_size: usize,
     matrix: &Matrix<P::ScalarField>,
@@ -73,5 +76,24 @@ pub(crate) fn evaluate_constraint<P: ark_ec::pairing::Pairing, T: co_groth16::Ci
         .map(|x| T::evaluate_constraint(id, x, public_inputs, private_witness))
         .collect::<Vec<_>>();
     result.resize(domain_size, T::ArithmeticShare::default());
+    result
+}
+
+pub fn evaluate_constraint_half_share<
+    P: ark_ec::pairing::Pairing,
+    T: co_groth16::CircomGroth16Prover<P>,
+>(
+    id: <T::State as MpcState>::PartyID,
+    domain_size: usize,
+    matrix: &Matrix<P::ScalarField>,
+    public_inputs: &[P::ScalarField],
+    private_witness: &[T::ArithmeticShare],
+) -> Vec<T::ArithmeticHalfShare> {
+    let mut result = matrix
+        .par_iter()
+        .with_min_len(256)
+        .map(|x| T::evaluate_constraint_half_share(id, x, public_inputs, private_witness))
+        .collect::<Vec<_>>();
+    result.resize(domain_size, T::ArithmeticHalfShare::default());
     result
 }

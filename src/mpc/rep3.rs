@@ -24,7 +24,7 @@ use crate::{
         ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar, ark_to_icicle_scalars,
         icicle_to_ark_scalar,
     },
-    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace},
+    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
 };
 use mpc_core::protocols::rep3::network::Rep3NetworkExt;
 
@@ -65,20 +65,30 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     }
 
     fn promote_to_trivial_shares(
-        _: <Self::State as MpcState>::PartyID,
+        id: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
     ) -> Self::DeviceShares {
-        let mut result = DeviceVec::device_malloc(public_values.len())
+        let mut a = DeviceVec::device_malloc(public_values.len())
             .expect("Failed to allocate device vector");
-        let mut zeros = DeviceVec::device_malloc(public_values.len())
+        let mut b = DeviceVec::device_malloc(public_values.len())
             .expect("Failed to allocate device vector");
-        zeros.memset(0, public_values.len()).unwrap();
-        result.copy(public_values).unwrap();
 
-        Self::DeviceShares {
-            a: result,
-            b: zeros,
+        match id {
+            PartyID::ID0 => {
+                a.copy(public_values).unwrap();
+                b.memset(0, public_values.len()).unwrap();
+            }
+            PartyID::ID1 => {
+                a.memset(0, public_values.len()).unwrap();
+                b.copy(public_values).unwrap();
+            }
+            PartyID::ID2 => {
+                a.memset(0, public_values.len()).unwrap();
+                b.memset(0, public_values.len()).unwrap();
+            }
         }
+
+        Self::DeviceShares { a, b }
     }
 
     // TODO CESAR: Check if there's a better way
@@ -87,19 +97,16 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         roots: &DeviceSlice<F>,
         stream: &IcicleStream,
     ) {
-        let mut result_a = DeviceVec::device_malloc_async(coeffs.a.len(), stream)
+        let mut a = DeviceVec::device_malloc_async(coeffs.a.len(), stream)
             .expect("Failed to allocate device vector");
-        let mut result_b = DeviceVec::device_malloc_async(coeffs.b.len(), stream)
+        let mut b = DeviceVec::device_malloc_async(coeffs.b.len(), stream)
             .expect("Failed to allocate device vector");
         let mut cfg = VecOpsConfig::default();
         cfg.stream_handle = **stream;
         cfg.is_async = true;
-        mul_scalars(&coeffs.a, roots, result_a.as_mut_slice(), &cfg).unwrap();
-        mul_scalars(&coeffs.b, roots, result_b.as_mut_slice(), &cfg).unwrap();
-        *coeffs = Self::DeviceShares {
-            a: result_a,
-            b: result_b,
-        };
+        mul_scalars(&coeffs.a, roots, a.as_mut_slice(), &cfg).unwrap();
+        mul_scalars(&coeffs.b, roots, b.as_mut_slice(), &cfg).unwrap();
+        *coeffs = Self::DeviceShares { a, b };
     }
 
     fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
@@ -112,14 +119,14 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         }
     }
 
-    fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream) {
-        fft_inplace(&mut input.a, stream);
-        fft_inplace(&mut input.b, stream);
+    fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
+        fft_inplace(&mut input.a, stream, coset_gen);
+        fft_inplace(&mut input.b, stream, coset_gen);
     }
 
-    fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream) {
-        ifft_inplace(&mut input.a, stream);
-        ifft_inplace(&mut input.b, stream);
+    fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
+        ifft_inplace(&mut input.a, stream, coset_gen);
+        ifft_inplace(&mut input.b, stream, coset_gen);
     }
 
     fn copy_to_device_shares(
@@ -163,6 +170,27 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         Self::DeviceShares { a, b }
     }
 
+    fn half_shares_to_device<
+        B: ArkIcicleBridge<IcicleScalarField = F>,
+        T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        shares: &Vec<T::ArithmeticHalfShare>,
+    ) -> DeviceVec<F> {
+        if std::any::TypeId::of::<T>()
+            != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
+        {
+            panic!("Invalid driver: expected Rep3Groth16Driver");
+        }
+
+        // SAFETY: At this point we know the shares are safe to transmute
+        let shares =
+            unsafe { transmute::<&Vec<T::ArithmeticHalfShare>, &Vec<B::ArkScalarField>>(shares) };
+
+        let shares = from_host_slice(&shares);
+
+        ark_to_icicle_scalars(shares).unwrap()
+    }
+
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: &Self::DeviceShares,
         b: &Self::DeviceShares,
@@ -179,9 +207,9 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         let mut tmp0 = DeviceVec::device_malloc_async(a.a.len(), stream)
             .expect("Failed to allocate device vector");
-        let mut tmp1 = DeviceVec::device_malloc_async(a.b.len(), stream)
+        let mut tmp1 = DeviceVec::device_malloc_async(a.a.len(), stream)
             .expect("Failed to allocate device vector");
-        let mut tmp2 = DeviceVec::device_malloc_async(a.b.len(), stream)
+        let mut tmp2 = DeviceVec::device_malloc_async(a.a.len(), stream)
             .expect("Failed to allocate device vector");
 
         let mut cfg = VecOpsConfig::default();
@@ -261,5 +289,49 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         )
         .into_affine();
         Ok(ark_to_icicle_affine(&res))
+    }
+
+    // TODO CESAR: remove
+    fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        shares: &Self::DeviceShares,
+        net: &N,
+        _: &mut Self::State,
+    ) -> eyre::Result<Vec<B::ArkScalarField>> {
+        let host_a = to_host_vec_icicle_scalar(&shares.a)
+            .into_iter()
+            .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
+            .collect::<Vec<_>>();
+        let host_b = to_host_vec_icicle_scalar(&shares.b)
+            .into_iter()
+            .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
+            .collect::<Vec<_>>();
+
+        let shares = host_a
+            .into_iter()
+            .zip(host_b.into_iter())
+            .map(|(a, b)| Rep3PrimeFieldShare { a, b })
+            .collect::<Vec<_>>();
+        let opened = arithmetic::open_vec(&shares, net).unwrap();
+
+        Ok(opened)
+    }
+
+    fn open_device_half_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        shares: &DeviceVec<F>,
+        net: &N,
+        _: &mut Self::State,
+    ) -> eyre::Result<Vec<B::ArkScalarField>> {
+        let host_a = to_host_vec_icicle_scalar(shares)
+            .into_iter()
+            .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
+            .collect::<Vec<_>>();
+
+        let (b, c) = net.broadcast_many(&host_a)?;
+
+        Ok(host_a
+            .into_iter()
+            .zip(b.into_iter().zip(c.into_iter()))
+            .map(|(a, (b, c))| a + b + c)
+            .collect::<Vec<_>>())
     }
 }

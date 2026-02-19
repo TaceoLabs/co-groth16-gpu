@@ -18,7 +18,10 @@ use icicle_runtime::{
 use mpc_core::MpcState;
 use mpc_net::Network;
 
-use crate::{bridges::ArkIcicleBridge, utils::evaluate_constraint};
+use crate::{
+    bridges::ArkIcicleBridge,
+    utils::{evaluate_constraint, evaluate_constraint_half_share},
+};
 
 pub use plain::PlainGroth16Driver;
 pub use rep3::Rep3Groth16Driver;
@@ -85,10 +88,10 @@ pub trait CircomGroth16Prover<
     );
 
     /// Performs the Fast Fourier Transform (FFT) in place.
-    fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream);
+    fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>);
 
     /// Performs the Inverse Fast Fourier Transform (IFFT) in place.
-    fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream);
+    fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>);
 
     /// Copies a slice of device shares to another device shares vector,
     /// starting and ending at the specified indices.
@@ -109,6 +112,14 @@ pub trait CircomGroth16Prover<
         shares: &Vec<T::ArithmeticShare>,
     ) -> Self::DeviceShares;
 
+    /// Converts a vector of arithmetic shares to device shares.
+    fn half_shares_to_device<
+        B: ArkIcicleBridge<IcicleScalarField = F>,
+        T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        shares: &Vec<T::ArithmeticHalfShare>,
+    ) -> DeviceVec<F>;
+
     /// Evaluates the constraints for a given party ID and transforms the results into device shares.
     fn evaluate_constraints<
         B: ArkIcicleBridge<IcicleScalarField = F>,
@@ -118,8 +129,13 @@ pub trait CircomGroth16Prover<
         matrices: &ConstraintMatrices<B::ArkScalarField>,
         public_inputs: &[B::ArkScalarField],
         private_witness: &[T::ArithmeticShare],
+        eval_c: bool,
         domain_size: usize,
-    ) -> (Self::DeviceShares, Self::DeviceShares) {
+    ) -> (
+        Self::DeviceShares,
+        Self::DeviceShares,
+        Option<DeviceVec<B::IcicleScalarField>>,
+    ) {
         let id = unsafe {
             transmute::<&<Self::State as MpcState>::PartyID, &<T::State as MpcState>::PartyID>(&id)
         };
@@ -140,9 +156,22 @@ pub trait CircomGroth16Prover<
             private_witness,
         );
 
+        let eval_c = if eval_c {
+            Some(evaluate_constraint_half_share::<B::ArkPairing, T>(
+                id.clone(),
+                domain_size,
+                &matrices.c,
+                public_inputs,
+                private_witness,
+            ))
+        } else {
+            None
+        };
+
         (
             Self::shares_to_device::<B, T>(&eval_a),
             Self::shares_to_device::<B, T>(&eval_b),
+            eval_c.map(|c| Self::half_shares_to_device::<B, T>(&c)),
         )
     }
 
@@ -196,4 +225,16 @@ pub trait CircomGroth16Prover<
         net: &N,
         state: &mut Self::State,
     ) -> eyre::Result<Affine<B::IcicleG1>>;
+
+    fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        shares: &Self::DeviceShares,
+        net: &N,
+        state: &mut Self::State,
+    ) -> eyre::Result<Vec<B::ArkScalarField>>;
+
+    fn open_device_half_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        shares: &DeviceVec<F>,
+        net: &N,
+        state: &mut Self::State,
+    ) -> eyre::Result<Vec<B::ArkScalarField>>;
 }
