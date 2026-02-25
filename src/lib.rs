@@ -7,10 +7,11 @@ mod gpu_utils;
 pub mod mpc;
 mod utils;
 mod verifier;
+use icicle_runtime::runtime;
 
 pub use groth16_gpu::{CircomReduction, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16};
 
-pub fn load_backend_from_env_and_set_device(device_idx: usize) {
+pub fn load_backend_from_env_and_set_device(device_idx: i32) {
     runtime::load_backend_from_env_or_default().unwrap();
 
     // Select CUDA device
@@ -32,7 +33,6 @@ mod tests {
     };
     use co_circom_types::SharedWitness;
     use co_groth16::{ConstraintMatrices, ProvingKey, VerifyingKey};
-    use icicle_runtime::runtime;
     use itertools::izip;
     use rand::thread_rng;
 
