@@ -723,7 +723,7 @@ dependencies = [
 [[package]]
 name = "co-circom-types"
 version = "0.6.0"
-source = "git+https://github.com/TaceoLabs/co-snarks?branch=feat%2Fincrease-visibility#f37a5b150201fd25a75a810efcdaabff6781e253"
+source = "git+https://github.com/TaceoLabs/co-snarks?rev=f37a5b150201fd25a75a810efcdaabff6781e253#f37a5b150201fd25a75a810efcdaabff6781e253"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
@@ -741,7 +741,7 @@ dependencies = [
 [[package]]
 name = "co-groth16"
 version = "0.10.0"
-source = "git+https://github.com/TaceoLabs/co-snarks?branch=feat%2Fincrease-visibility#f37a5b150201fd25a75a810efcdaabff6781e253"
+source = "git+https://github.com/TaceoLabs/co-snarks?rev=f37a5b150201fd25a75a810efcdaabff6781e253#f37a5b150201fd25a75a810efcdaabff6781e253"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -1544,7 +1544,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mpc-core"
 version = "0.10.0"
-source = "git+https://github.com/TaceoLabs/co-snarks?branch=feat%2Fincrease-visibility#f37a5b150201fd25a75a810efcdaabff6781e253"
+source = "git+https://github.com/TaceoLabs/co-snarks?rev=f37a5b150201fd25a75a810efcdaabff6781e253#f37a5b150201fd25a75a810efcdaabff6781e253"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -1575,7 +1575,7 @@ dependencies = [
 [[package]]
 name = "mpc-net"
 version = "0.5.0"
-source = "git+https://github.com/TaceoLabs/co-snarks?branch=feat%2Fincrease-visibility#f37a5b150201fd25a75a810efcdaabff6781e253"
+source = "git+https://github.com/TaceoLabs/co-snarks?rev=f37a5b150201fd25a75a810efcdaabff6781e253#f37a5b150201fd25a75a810efcdaabff6781e253"
 dependencies = [
  "byteorder",
  "bytes",
