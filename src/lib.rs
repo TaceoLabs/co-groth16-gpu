@@ -10,6 +10,14 @@ mod verifier;
 
 pub use groth16_gpu::{CircomReduction, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16};
 
+pub fn load_backend_from_env_and_set_device(device_idx: usize) {
+    runtime::load_backend_from_env_or_default().unwrap();
+
+    // Select CUDA device
+    let device = icicle_runtime::Device::new("CUDA", device_idx);
+    icicle_runtime::set_device(&device).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -34,17 +42,13 @@ mod tests {
     use crate::{
         CircomReduction, Rep3CoGroth16,
         groth16_gpu::{Groth16, LibSnarkReduction},
+        load_backend_from_env_and_set_device,
     };
 
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_and_verify_bn254() {
-        // TODO CESAR: Handle properly
-        runtime::load_backend_from_env_or_default().unwrap();
-
-        // Select CUDA device
-        let device = icicle_runtime::Device::new("CUDA", 0);
-        icicle_runtime::set_device(&device).unwrap();
+        load_backend_from_env_and_set_device(0);
 
         for check in [CheckElement::Yes, CheckElement::No] {
             let zkey_file =
@@ -87,12 +91,7 @@ mod tests {
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_and_verify_poseidon_hash_bn254() {
-        // TODO CESAR: Handle properly
-        runtime::load_backend_from_env_or_default().unwrap();
-
-        // Select CUDA device
-        let device = icicle_runtime::Device::new("CUDA", 0);
-        icicle_runtime::set_device(&device).unwrap();
+        load_backend_from_env_and_set_device(0);
 
         for check in [CheckElement::Yes, CheckElement::No] {
             let zkey_file = File::open("test_vectors/Groth16/bn254/poseidon/circuit.zkey").unwrap();
@@ -134,12 +133,7 @@ mod tests {
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_and_verify_poseidon_hash_bn254_rep3() {
-        // TODO CESAR: Handle properly
-        runtime::load_backend_from_env_or_default().unwrap();
-
-        // Select CUDA device
-        let device = icicle_runtime::Device::new("CUDA", 0);
-        icicle_runtime::set_device(&device).unwrap();
+        load_backend_from_env_and_set_device(0);
 
         for check in [CheckElement::Yes, CheckElement::No] {
             let zkey_file = File::open("test_vectors/Groth16/bn254/poseidon/circuit.zkey").unwrap();
@@ -196,12 +190,7 @@ mod tests {
     }
 
     fn proof_libsnark_penumbra_bls12_377(circuit: &str) {
-        // TODO CESAR: Handle properly
-        runtime::load_backend_from_env_or_default().unwrap();
-
-        // Select CUDA device
-        let device = icicle_runtime::Device::new("CUDA", 0);
-        icicle_runtime::set_device(&device).unwrap();
+        load_backend_from_env_and_set_device(0);
 
         let pkey_file = File::open(format!(
             "test_vectors/Groth16/bls12_377/{circuit}/circuit.pk"
