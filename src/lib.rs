@@ -68,6 +68,17 @@ mod tests {
                 public_inputs: public_input.clone(),
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
+            println!("------------------- Proving (CPU) --------------------");
+            println!("\n");
+            let timer_start = std::time::Instant::now();
+            let _ = co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>(
+                &pkey,
+                &matrices,
+                witness.clone(),
+            )
+            .expect("proof generation works");
+            println!("Time taken for CPU proving: {:?}", timer_start.elapsed());
+            println!("\n");
             println!("-------------- Proving (before warm-up) --------------");
             println!("\n");
             let _ =
@@ -110,17 +121,33 @@ mod tests {
                 public_inputs: public_input.clone(),
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
-            println!("-------------- Proving (before warm-up) --------------");
+            println!("------------------- Proving (CPU) --------------------");
+            println!("\n");
+            let timer_start = std::time::Instant::now();
+            let _ = co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>(
+                &pkey,
+                &matrices,
+                witness.clone(),
+            )
+            .expect("proof generation works");
+            println!("Time taken for CPU proving: {:?}", timer_start.elapsed());
+            println!("\n");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+
+            println!("-------------- Proving (GPU before warm-up) --------------");
             println!("\n");
             let _ =
                 Groth16::<Bn254>::plain_prove::<CircomReduction>(&pkey, &matrices, witness.clone())
                     .expect("proof generation works");
             println!("\n");
-            println!("-------------- Proving (after warm-up) --------------");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+
+            println!("-------------- Proving (GPU after warm-up) --------------");
             println!("\n");
             let proof = Groth16::<Bn254>::plain_prove::<CircomReduction>(&pkey, &matrices, witness)
                 .expect("proof generation works");
             println!("\n");
+            std::thread::sleep(std::time::Duration::from_secs(5));
 
             let proof = CircomGroth16Proof::from(proof);
             let ser_proof = serde_json::to_string(&proof).unwrap();
@@ -231,22 +258,42 @@ mod tests {
             public_inputs: public_input.clone(),
             witness: witness.values[matrices.num_instance_variables..].to_vec(),
         };
+        println!("-------------- Proving (CPU) --------------");
+        println!("\n");
+        let timer_start = std::time::Instant::now();
+        let _ = co_groth16::Groth16::<Bls12_377>::plain_prove::<co_groth16::LibSnarkReduction>(
+            &pkey,
+            &matrices,
+            witness.clone(),
+        )
+        .expect("proof generation works");
+        println!("Time taken for CPU proving: {:?}", timer_start.elapsed());
+        println!("\n");
 
         println!("-------------- Proving (before warm-up) --------------");
         println!("\n");
+        let timer_start = std::time::Instant::now();
         let _ = Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>(
             &pkey,
             &matrices,
             witness.clone(),
         )
         .expect("proof generation works");
-
+        println!(
+            "Time taken for GPU proving (before warm-up): {:?}",
+            timer_start.elapsed()
+        );
         println!("\n");
         println!("-------------- Proving (after warm-up) --------------");
         println!("\n");
+        let timer_start = std::time::Instant::now();
         let proof =
             Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>(&pkey, &matrices, witness)
                 .expect("proof generation works");
+        println!(
+            "Time taken for GPU proving (after warm-up): {:?}",
+            timer_start.elapsed()
+        );
         println!("\n");
         Groth16::<Bls12_377>::verify(&vk, &proof, &public_input[1..]).expect("can verify");
     }

@@ -17,6 +17,20 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
+#[macro_export]
+macro_rules! rayon_join_5 {
+    ($f1:expr, $f2:expr, $f3:expr, $f4:expr, $f5:expr $(,)?) => {{
+        use rayon::join;
+
+        let ((a, b), ((c, d), e)) = join(
+            || join(|| $f1(), || $f2()),
+            || join(|| join(|| $f3(), || $f4()), || $f5()),
+        );
+
+        (a, b, c, d, e)
+    }};
+}
+
 use crate::bridges::{ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar};
 use crate::utils::root_of_unity_for_groth16;
 
@@ -25,6 +39,16 @@ pub fn from_host_slice<T>(slice: &[T]) -> DeviceVec<T> {
     let mut result = DeviceVec::device_malloc(count).expect("Failed to allocate device vector");
     result
         .copy_from_host(HostSlice::from_slice(slice))
+        .expect("Failed to copy data from host to device");
+    result
+}
+
+pub fn from_host_slice_async<T>(slice: &[T], stream: &IcicleStream) -> DeviceVec<T> {
+    let count = slice.len();
+    let mut result =
+        DeviceVec::device_malloc_async(count, stream).expect("Failed to allocate device vector");
+    result
+        .copy_from_host_async(HostSlice::from_slice(slice), stream)
         .expect("Failed to copy data from host to device");
     result
 }
@@ -76,6 +100,7 @@ pub fn get_first_affine<C: Curve>(vec: &DeviceSlice<Affine<C>>) -> Option<Affine
     let mut host_vec = to_host_vec_affine(vec.index(..1));
     host_vec.pop()
 }
+
 pub(crate) struct Proof<
     F: FieldImpl<Config: VecOps<F> + NTT<F, F>>,
     C1: Curve<ScalarField = F>,
@@ -165,36 +190,53 @@ impl<
 
         let beta_g1 = ark_to_icicle_affine(&pk.beta_g1);
         let delta_g1 = ark_to_icicle_affine(&pk.delta_g1);
-        let a_query = from_host_slice(
-            &pk.a_query
+
+        let (a_query, b_g1_query, b_g2_query, h_query, l_query) = rayon_join_5!(
+            || pk
+                .a_query
+                .iter()
+                .map(ark_to_icicle_affine)
+                .collect::<Vec<_>>(),
+            || pk
+                .b_g1_query
+                .iter()
+                .map(ark_to_icicle_affine)
+                .collect::<Vec<_>>(),
+            || pk
+                .b_g2_query
+                .iter()
+                .map(ark_to_icicle_affine)
+                .collect::<Vec<_>>(),
+            || pk
+                .h_query
+                .iter()
+                .map(ark_to_icicle_affine)
+                .collect::<Vec<_>>(),
+            || pk
+                .l_query
                 .iter()
                 .map(ark_to_icicle_affine)
                 .collect::<Vec<_>>(),
         );
-        let b_g1_query = from_host_slice(
-            &pk.b_g1_query
-                .iter()
-                .map(ark_to_icicle_affine)
-                .collect::<Vec<_>>(),
-        );
-        let b_g2_query = from_host_slice(
-            &pk.b_g2_query
-                .iter()
-                .map(ark_to_icicle_affine)
-                .collect::<Vec<_>>(),
-        );
-        let h_query = from_host_slice(
-            &pk.h_query
-                .iter()
-                .map(ark_to_icicle_affine)
-                .collect::<Vec<_>>(),
-        );
-        let l_query = from_host_slice(
-            &pk.l_query
-                .iter()
-                .map(ark_to_icicle_affine)
-                .collect::<Vec<_>>(),
-        );
+
+        let mut streams = (0..5)
+            .map(|_| IcicleStream::create().unwrap())
+            .collect::<Vec<_>>();
+
+        let a_query = from_host_slice_async(&a_query, &streams[0]);
+
+        let b_g1_query = from_host_slice_async(&b_g1_query, &streams[1]);
+
+        let b_g2_query = from_host_slice_async(&b_g2_query, &streams[2]);
+
+        let h_query = from_host_slice_async(&h_query, &streams[3]);
+
+        let l_query = from_host_slice_async(&l_query, &streams[4]);
+
+        streams.iter_mut().for_each(|stream| {
+            stream.synchronize().unwrap();
+            stream.destroy().unwrap();
+        });
 
         let mut domain = GeneralEvaluationDomain::<P::ScalarField>::new(
             num_constraints + num_instance_variables,

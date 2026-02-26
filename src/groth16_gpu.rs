@@ -15,7 +15,6 @@ use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_net::Network;
 use std::marker::PhantomData;
 use std::mem::transmute;
-use std::time;
 
 use icicle_core::msm::MSM;
 
@@ -76,7 +75,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         DeviceVec<B::IcicleScalarField>,
         T::DeviceShares,
     )> {
-        let timer_start = time::Instant::now();
         let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
             id,
             matrices,
@@ -85,12 +83,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             R::requires_eval_c(),
             domain_size,
         );
-        println!(
-            "Constraint evaluation took {} ms",
-            timer_start.elapsed().as_millis()
-        );
 
-        let timer_start = time::Instant::now();
         initialize_domain::<B::IcicleScalarField>(domain_size);
 
         let private_witness = T::shares_to_device::<B, U>(private_witness);
@@ -103,10 +96,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         );
 
         let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
-        println!(
-            "GPU setup and transfer took {} ms",
-            timer_start.elapsed().as_millis()
-        );
 
         Ok((key, eval_a, eval_b, eval_c, public_inputs, private_witness))
     }
@@ -304,7 +293,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let g_a = r_g1;
         let g1_b = s_g1;
 
-        // TODO CESAR: Use threads
         let g_a_opened = T::open_half_point_g1::<_, B>(g_a, net0, state0)?;
         let r_g1_b = T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1)?;
 
@@ -316,15 +304,16 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         g_c = g_c + l_acc;
         g_c = g_c + h_acc;
 
-        // TODO CESAR: Use threads
         let g2_b = s_g2;
-        let g_c_opened = T::open_half_point_g1::<_, B>(g_c.into(), net0, state0)?;
-        let g2_b_opened = T::open_half_point_g2::<_, B>(g2_b, net1, state1)?;
+        let (g_c_opened, g2_b_opened) = rayon::join(
+            || T::open_half_point_g1::<_, B>(g_c.into(), net0, state0),
+            || T::open_half_point_g2::<_, B>(g2_b, net1, state1),
+        );
 
         Ok(Proof {
             a: g_a_opened,
-            b: g2_b_opened,
-            c: g_c_opened,
+            b: g2_b_opened?,
+            c: g_c_opened?,
         })
     }
 }
