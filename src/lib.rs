@@ -27,27 +27,73 @@ mod tests {
 
     use ark_relations::r1cs::Matrix;
     use ark_serialize::CanonicalDeserialize;
-    use circom_types::{
-        CheckElement, Witness,
-        groth16::{Proof as CircomGroth16Proof, VerificationKey as JsonVerificationKey, Zkey},
-    };
+    use circom_types::{CheckElement, Witness, groth16::Zkey};
     use co_circom_types::SharedWitness;
-    use co_groth16::{ConstraintMatrices, ProvingKey, VerifyingKey};
+    use co_groth16::{ConstraintMatrices, ProvingKey};
     use itertools::izip;
-    use rand::thread_rng;
+    use mpc_net::{Network, local::LocalNetwork};
 
-    use mpc_net::local::LocalNetwork;
     use std::{fs::File, sync::Arc};
 
     use crate::{
-        CircomReduction, Rep3CoGroth16,
-        groth16_gpu::{Groth16, LibSnarkReduction},
+        CircomReduction, LibSnarkReduction, Rep3CoGroth16, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
     };
 
+    macro_rules! run_provers {
+        (
+        cpu_prove = $cpu_prove:expr,
+        gpu_prove = $gpu_prove:expr,
+        pkey = $pkey:expr,
+        matrices = $matrices:expr,
+        witness = $witness:expr,
+        silent = $silent:expr
+    ) => {{
+            use std::time::Instant;
+
+            // ---- CPU prove ----
+            if !$silent {
+                println!("------------------- Proving (CPU) --------------------\n");
+            }
+            let t0 = Instant::now();
+            let _ = ($cpu_prove)($pkey, $matrices, $witness.clone())
+                .expect("CPU proof generation works");
+            if !$silent {
+                println!("Time taken for CPU proving: {:?}\n", t0.elapsed());
+
+                // ---- GPU warm-up ----
+                println!("-------------- Proving (GPU before warm-up) --------------\n");
+            }
+            let t1 = Instant::now();
+            let _ = ($gpu_prove)($pkey, $matrices, $witness.clone())
+                .expect("GPU proof generation works (before warm-up)");
+
+            if !$silent {
+                println!(
+                    "Time taken for GPU proving (before warm-up): {:?}\n",
+                    t1.elapsed()
+                );
+
+                // ---- GPU final prove ----
+                println!("-------------- Proving (GPU after warm-up) --------------\n");
+            }
+            let t2 = Instant::now();
+            let _ = ($gpu_prove)($pkey, $matrices, $witness)
+                .expect("GPU proof generation works (after warm-up)");
+
+            if !$silent {
+                println!(
+                    "Time taken for GPU proving (after warm-up): {:?}\n",
+                    t2.elapsed()
+                );
+            }
+
+            println!("\n");
+        }};
+    }
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
-    fn create_proof_and_verify_bn254() {
+    fn create_proof_multiplier2_bn254() {
         load_backend_from_env_and_set_device(0);
 
         for check in [CheckElement::Yes, CheckElement::No] {
@@ -55,119 +101,68 @@ mod tests {
                 File::open("test_vectors/Groth16/bn254/multiplier2/circuit.zkey").unwrap();
             let witness_file =
                 File::open("test_vectors/Groth16/bn254/multiplier2/witness.wtns").unwrap();
-            let vk_file =
-                File::open("test_vectors/Groth16/bn254/multiplier2/verification_key.json").unwrap();
 
             let witness = Witness::<ark_bn254::Fr>::from_reader(witness_file).unwrap();
             let zkey = Zkey::<Bn254>::from_reader(zkey_file, check).unwrap();
             let (matrices, pkey) = zkey.into();
-            let vk: JsonVerificationKey<Bn254> = serde_json::from_reader(vk_file).unwrap();
-            let vk = vk.into();
+
             let public_input = witness.values[..matrices.num_instance_variables].to_vec();
             let witness = SharedWitness {
                 public_inputs: public_input.clone(),
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
-            println!("------------------- Proving (CPU) --------------------");
-            println!("\n");
-            let timer_start = std::time::Instant::now();
-            let _ = co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>(
-                &pkey,
-                &matrices,
-                witness.clone(),
-            )
-            .expect("proof generation works");
-            println!("Time taken for CPU proving: {:?}", timer_start.elapsed());
-            println!("\n");
-            println!("-------------- Proving (before warm-up) --------------");
-            println!("\n");
-            let _ =
-                Groth16::<Bn254>::plain_prove::<CircomReduction>(&pkey, &matrices, witness.clone())
-                    .expect("proof generation works");
-            println!("\n");
-            println!("-------------- Proving (after warm-up) --------------");
-            println!("\n");
-            let proof = Groth16::<Bn254>::plain_prove::<CircomReduction>(&pkey, &matrices, witness)
-                .expect("proof generation works");
-            println!("\n");
 
-            let proof = CircomGroth16Proof::from(proof);
-            let ser_proof = serde_json::to_string(&proof).unwrap();
-            let der_proof = serde_json::from_str::<CircomGroth16Proof<Bn254>>(&ser_proof).unwrap();
-            let der_proof = der_proof.into();
-            Groth16::verify(&vk, &der_proof, &public_input[1..]).expect("can verify");
+            run_provers!(
+                cpu_prove =
+                    co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
+                gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
+                pkey = &pkey,
+                matrices = &matrices,
+                witness = witness,
+                silent = false
+            );
         }
     }
 
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
-    fn create_proof_and_verify_poseidon_hash_bn254() {
+    fn create_proof_poseidon_hash_bn254() {
         load_backend_from_env_and_set_device(0);
 
         for check in [CheckElement::Yes, CheckElement::No] {
             let zkey_file = File::open("test_vectors/Groth16/bn254/poseidon/circuit.zkey").unwrap();
             let witness_file =
                 File::open("test_vectors/Groth16/bn254/poseidon/witness.wtns").unwrap();
-            let vk_file =
-                File::open("test_vectors/Groth16/bn254/poseidon/verification_key.json").unwrap();
 
             let witness = Witness::<ark_bn254::Fr>::from_reader(witness_file).unwrap();
             let zkey = Zkey::<Bn254>::from_reader(zkey_file, check).unwrap();
             let (matrices, pkey) = zkey.into();
-            let vk: JsonVerificationKey<Bn254> = serde_json::from_reader(vk_file).unwrap();
-            let vk = vk.into();
             let public_input = witness.values[..matrices.num_instance_variables].to_vec();
             let witness = SharedWitness {
                 public_inputs: public_input.clone(),
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
-            println!("------------------- Proving (CPU) --------------------");
-            println!("\n");
-            let timer_start = std::time::Instant::now();
-            let _ = co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>(
-                &pkey,
-                &matrices,
-                witness.clone(),
-            )
-            .expect("proof generation works");
-            println!("Time taken for CPU proving: {:?}", timer_start.elapsed());
-            println!("\n");
-            std::thread::sleep(std::time::Duration::from_secs(5));
-
-            println!("-------------- Proving (GPU before warm-up) --------------");
-            println!("\n");
-            let _ =
-                Groth16::<Bn254>::plain_prove::<CircomReduction>(&pkey, &matrices, witness.clone())
-                    .expect("proof generation works");
-            println!("\n");
-            std::thread::sleep(std::time::Duration::from_secs(5));
-
-            println!("-------------- Proving (GPU after warm-up) --------------");
-            println!("\n");
-            let proof = Groth16::<Bn254>::plain_prove::<CircomReduction>(&pkey, &matrices, witness)
-                .expect("proof generation works");
-            println!("\n");
-            std::thread::sleep(std::time::Duration::from_secs(5));
-
-            let proof = CircomGroth16Proof::from(proof);
-            let ser_proof = serde_json::to_string(&proof).unwrap();
-            let der_proof = serde_json::from_str::<CircomGroth16Proof<Bn254>>(&ser_proof).unwrap();
-            let der_proof = der_proof.into();
-            Groth16::verify(&vk, &der_proof, &public_input[1..]).expect("can verify");
+            run_provers!(
+                cpu_prove =
+                    co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
+                gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
+                pkey = &pkey,
+                matrices = &matrices,
+                witness = witness,
+                silent = false
+            );
         }
     }
 
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
-    fn create_proof_and_verify_poseidon_hash_bn254_rep3() {
+    fn create_proof_poseidon_hash_bn254_rep3() {
         load_backend_from_env_and_set_device(0);
 
         for check in [CheckElement::Yes, CheckElement::No] {
             let zkey_file = File::open("test_vectors/Groth16/bn254/poseidon/circuit.zkey").unwrap();
             let witness_file =
                 File::open("test_vectors/Groth16/bn254/poseidon/witness.wtns").unwrap();
-            let vk_file =
-                File::open("test_vectors/Groth16/bn254/poseidon/verification_key.json").unwrap();
 
             let witness = Witness::<ark_bn254::Fr>::from_reader(witness_file).unwrap();
             let zkey = Zkey::<Bn254>::from_reader(zkey_file, check).unwrap();
@@ -176,12 +171,8 @@ mod tests {
             let zkey1 = Arc::new(zkey);
             let zkey2 = Arc::clone(&zkey1);
             let zkey3 = Arc::clone(&zkey1);
-            let public_input = witness.values[..zkey1.0.num_instance_variables].to_vec();
 
-            let vk: JsonVerificationKey<Bn254> = serde_json::from_reader(vk_file).unwrap();
-            let vk = vk.into();
-
-            let mut rng = thread_rng();
+            let mut rng = rand::thread_rng();
             let [witness_share1, witness_share2, witness_share3] =
                 SharedWitness::share_rep3(witness, zkey1.0.num_instance_variables, &mut rng);
 
@@ -196,23 +187,44 @@ mod tests {
                 [zkey1, zkey2, zkey3].into_iter()
             ) {
                 threads.push(std::thread::spawn(move || {
-                    Rep3CoGroth16::<Bn254>::prove::<_, CircomReduction>(
-                        &net0, &net1, &zkey.1, &zkey.0, x,
-                    )
-                    .unwrap()
+                    let cpu_prove = |pkey, matrices, witness| {
+                        co_groth16::Rep3CoGroth16::<Bn254>::prove::<
+                            LocalNetwork,
+                            co_groth16::CircomReduction,
+                        >(&net0, &net1, pkey, matrices, witness)
+                    };
+
+                    let gpu_prove = |pkey, matrices, witness| {
+                        Rep3CoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
+                            &net0, &net1, pkey, matrices, witness,
+                        )
+                    };
+
+                    if net0.id() == 0 {
+                        run_provers!(
+                            cpu_prove = cpu_prove,
+                            gpu_prove = gpu_prove,
+                            pkey = &zkey.1,
+                            matrices = &zkey.0,
+                            witness = x,
+                            silent = false
+                        );
+                    } else {
+                        run_provers!(
+                            cpu_prove = cpu_prove,
+                            gpu_prove = cpu_prove,
+                            pkey = &zkey.1,
+                            matrices = &zkey.0,
+                            witness = x,
+                            silent = true
+                        );
+                    }
                 }));
             }
 
-            let result3 = threads.pop().unwrap().join().unwrap();
-            let result2 = threads.pop().unwrap().join().unwrap();
-            let result1 = threads.pop().unwrap().join().unwrap();
-            assert_eq!(result1, result2);
-            assert_eq!(result2, result3);
-            let proof = CircomGroth16Proof::from(result1);
-            let ser_proof = serde_json::to_string(&proof).unwrap();
-            let der_proof = serde_json::from_str::<CircomGroth16Proof<Bn254>>(&ser_proof).unwrap();
-            let der_proof = der_proof.into();
-            Groth16::verify(&vk, &der_proof, &public_input[1..]).expect("can verify");
+            let _ = threads.pop().unwrap().join().unwrap();
+            let _ = threads.pop().unwrap().join().unwrap();
+            let _ = threads.pop().unwrap().join().unwrap();
         }
     }
 
@@ -230,10 +242,7 @@ mod tests {
             "test_vectors/Groth16/bls12_377/{circuit}/witness.wtns"
         ))
         .unwrap();
-        let vk_file = File::open(format!(
-            "test_vectors/Groth16/bls12_377/{circuit}/circuit.vk"
-        ))
-        .unwrap();
+
         let witness = Witness::<ark_bls12_377::Fr>::from_reader(witness_file).unwrap();
         let pkey = ProvingKey::<Bls12_377>::deserialize_uncompressed_unchecked(pkey_file).unwrap();
         // TODO once we can serde ConstraintMatrices, we dont need to do this anymore
@@ -252,50 +261,20 @@ mod tests {
             c,
         };
 
-        let vk = VerifyingKey::<Bls12_377>::deserialize_uncompressed_unchecked(vk_file).unwrap();
         let public_input = witness.values[..matrices.num_instance_variables].to_vec();
         let witness = SharedWitness {
             public_inputs: public_input.clone(),
             witness: witness.values[matrices.num_instance_variables..].to_vec(),
         };
-        println!("-------------- Proving (CPU) --------------");
-        println!("\n");
-        let timer_start = std::time::Instant::now();
-        let _ = co_groth16::Groth16::<Bls12_377>::plain_prove::<co_groth16::LibSnarkReduction>(
-            &pkey,
-            &matrices,
-            witness.clone(),
-        )
-        .expect("proof generation works");
-        println!("Time taken for CPU proving: {:?}", timer_start.elapsed());
-        println!("\n");
-
-        println!("-------------- Proving (before warm-up) --------------");
-        println!("\n");
-        let timer_start = std::time::Instant::now();
-        let _ = Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>(
-            &pkey,
-            &matrices,
-            witness.clone(),
-        )
-        .expect("proof generation works");
-        println!(
-            "Time taken for GPU proving (before warm-up): {:?}",
-            timer_start.elapsed()
+        run_provers!(
+            cpu_prove =
+                co_groth16::Groth16::<Bls12_377>::plain_prove::<co_groth16::LibSnarkReduction>,
+            gpu_prove = Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>,
+            pkey = &pkey,
+            matrices = &matrices,
+            witness = witness,
+            silent = false
         );
-        println!("\n");
-        println!("-------------- Proving (after warm-up) --------------");
-        println!("\n");
-        let timer_start = std::time::Instant::now();
-        let proof =
-            Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>(&pkey, &matrices, witness)
-                .expect("proof generation works");
-        println!(
-            "Time taken for GPU proving (after warm-up): {:?}",
-            timer_start.elapsed()
-        );
-        println!("\n");
-        Groth16::<Bls12_377>::verify(&vk, &proof, &public_input[1..]).expect("can verify");
     }
 
     #[test]
