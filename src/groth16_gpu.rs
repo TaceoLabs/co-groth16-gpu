@@ -23,7 +23,6 @@ use crate::gpu_utils::{Proof, ProvingKey, VerifyingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
-// use crate::mpc::shamir::ShamirGroth16Driver;
 
 pub use reduction::{CircomReduction, LibSnarkReduction, R1CSToQAP};
 mod reduction;
@@ -46,13 +45,6 @@ pub struct Groth16<P> {
 pub struct Rep3CoGroth16<P> {
     phantom_data: PhantomData<P>,
 }
-
-/// A type alias for a [CoGroth16] protocol using replicated secret sharing, using the Circom R1CSToQAPReduction by default.
-// TODO CESAR
-// pub type Rep3CoGroth16<P> = CoGroth16<P, Rep3Groth16Driver>;
-/// A type alias for a [CoGroth16] protocol using shamir secret sharing, using the Circom R1CSToQAPReduction by default.
-// TODO CESAR
-// pub type ShamirCoGroth16<P> = CoGroth16<P, ShamirGroth16Driver>;
 
 /// A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
 pub struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> {
@@ -293,8 +285,10 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let g_a = r_g1;
         let g1_b = s_g1;
 
-        let g_a_opened = T::open_half_point_g1::<_, B>(g_a, net0, state0)?;
-        let r_g1_b = T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1)?;
+        let (g_a_opened, r_g1_b) = rayon::join(
+            || T::open_half_point_g1::<_, B>(g_a, net0, state0).expect("Failed to open g_a"),
+            || T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1).expect("Failed to scalar mul g1_b with r")
+        );
 
         let s_g_a = g_a_opened.to_projective() * s_hs;
 

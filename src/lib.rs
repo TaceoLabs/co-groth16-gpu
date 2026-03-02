@@ -6,7 +6,6 @@ mod gpu_utils;
 /// This module contains the Groth16 prover trait
 pub mod mpc;
 mod utils;
-mod verifier;
 use icicle_runtime::runtime;
 
 pub use groth16_gpu::{CircomReduction, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16};
@@ -25,15 +24,20 @@ mod tests {
     use ark_bls12_377::Bls12_377;
     use ark_bn254::Bn254;
 
+    use ark_ff::UniformRand;
     use ark_relations::r1cs::Matrix;
     use ark_serialize::CanonicalDeserialize;
     use circom_types::{CheckElement, Witness, groth16::Zkey};
     use co_circom_types::SharedWitness;
     use co_groth16::{ConstraintMatrices, ProvingKey};
+    use eyre::Ok;
     use itertools::izip;
+    use mpc_core::protocols::rep3::conversion::A2BType;
+    use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State, network::Rep3NetworkExt};
     use mpc_net::{Network, local::LocalNetwork};
+    use rand::thread_rng;
 
-    use std::{fs::File, sync::Arc};
+    use std::{fs::File, io::BufReader, sync::Arc};
 
     use crate::{
         CircomReduction, LibSnarkReduction, Rep3CoGroth16, groth16_gpu::Groth16,
@@ -53,6 +57,7 @@ mod tests {
 
             // ---- CPU prove ----
             if !$silent {
+                println!("\n");
                 println!("------------------- Proving (CPU) --------------------\n");
             }
             let t0 = Instant::now();
@@ -86,11 +91,40 @@ mod tests {
                     "Time taken for GPU proving (after warm-up): {:?}\n",
                     t2.elapsed()
                 );
+                println!("\n");
             }
-
-            println!("\n");
         }};
     }
+
+    fn dummy_prove<P: ark_ec::pairing::Pairing, S>(
+        net0: &LocalNetwork,
+        net1: &LocalNetwork,
+        _pkey: &ProvingKey<P>,
+        _matrices: &ConstraintMatrices<P::ScalarField>,
+        _witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
+    ) -> eyre::Result<()> {
+        let _ = Rep3State::new(net0, A2BType::default()).unwrap();
+
+        // Dummy network operations
+
+        // Open g_a (G1)
+        net0.broadcast(P::G1Affine::rand(&mut thread_rng()))
+            .unwrap();
+
+        // Scalar Mul g1_b * r
+        net1.reshare(P::G1Affine::rand(&mut thread_rng())).unwrap();
+
+        // Open g_c (G1)
+        net0.broadcast(P::G1Affine::rand(&mut thread_rng()))
+            .unwrap();
+
+        // Open g_2_b (G2)
+        net1.broadcast(P::G2Affine::rand(&mut thread_rng()))
+            .unwrap();
+
+        Ok(())
+    }
+
     #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_multiplier2_bn254() {
@@ -155,6 +189,132 @@ mod tests {
     }
 
     #[test]
+    //#[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
+    fn create_proof_transaction_batched_bn254() {
+        load_backend_from_env_and_set_device(0);
+
+        for check in [CheckElement::Yes, CheckElement::No] {
+            let zkey_file =
+                File::open("test_vectors/Groth16/bn254/transaction_batched/circuit.zkey").unwrap();
+            let witness_file =
+                File::open("test_vectors/Groth16/bn254/transaction_batched/witness.bin").unwrap();
+            let mut reader = BufReader::new(witness_file);
+
+            let witness = Vec::<ark_bn254::Fr>::deserialize_uncompressed(&mut reader).unwrap();
+
+            let zkey = Zkey::<Bn254>::from_reader(zkey_file, check).unwrap();
+            let (matrices, pkey) = zkey.into();
+
+            let public_input = witness[..matrices.num_instance_variables].to_vec();
+
+            let witness = SharedWitness {
+                public_inputs: public_input.clone(),
+                witness: witness[matrices.num_instance_variables..].to_vec(),
+            };
+            run_provers!(
+                cpu_prove =
+                    co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
+                gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
+                pkey = &pkey,
+                matrices = &matrices,
+                witness = witness,
+                silent = false
+            );
+        }
+    }
+
+    #[test]
+    //#[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
+    fn create_proof_transaction_batched_bn254_rep3() {
+        for check in [CheckElement::Yes, CheckElement::No] {
+            let zkey_file =
+                File::open("test_vectors/Groth16/bn254/transaction_batched/circuit.zkey").unwrap();
+            let witness_file =
+                File::open("test_vectors/Groth16/bn254/transaction_batched/witness.bin").unwrap();
+            let mut reader = BufReader::new(witness_file);
+
+            let witness = Vec::<ark_bn254::Fr>::deserialize_uncompressed(&mut reader).unwrap();
+
+            let zkey = Zkey::<Bn254>::from_reader(zkey_file, check).unwrap();
+
+            let witness = Witness::<ark_bn254::Fr> { values: witness };
+
+            let zkey: (ConstraintMatrices<_>, ProvingKey<_>) = zkey.into();
+            let zkey1 = Arc::new(zkey);
+            let zkey2 = Arc::clone(&zkey1);
+            let zkey3 = Arc::clone(&zkey1);
+
+            let mut rng = rand::thread_rng();
+            let [witness_share1, witness_share2, witness_share3] =
+                SharedWitness::share_rep3(witness, zkey1.0.num_instance_variables, &mut rng);
+
+            let nets0 = LocalNetwork::new_3_parties();
+            let nets1 = LocalNetwork::new_3_parties();
+
+            let mut threads = vec![];
+            for (net0, net1, x, zkey) in izip!(
+                nets0,
+                nets1,
+                [witness_share1, witness_share2, witness_share3].into_iter(),
+                [zkey1, zkey2, zkey3].into_iter()
+            ) {
+                threads.push(std::thread::spawn(move || {
+                    if net0.id() == 0 {
+                        load_backend_from_env_and_set_device(0);
+
+                        let cpu_prove = |pkey, matrices, witness| {
+                            co_groth16::Rep3CoGroth16::<Bn254>::prove::<
+                                LocalNetwork,
+                                co_groth16::CircomReduction,
+                            >(&net0, &net1, pkey, matrices, witness)
+                        };
+
+                        let gpu_prove = |pkey, matrices, witness| {
+                            Rep3CoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
+                                &net0, &net1, pkey, matrices, witness,
+                            )
+                        };
+
+                        run_provers!(
+                            cpu_prove = cpu_prove,
+                            gpu_prove = gpu_prove,
+                            pkey = &zkey.1,
+                            matrices = &zkey.0,
+                            witness = x,
+                            silent = false // only print for the first party to avoid cluttering the output
+                        );
+                    } else {
+                        let cpu_prove = |pkey, matrices, witness| {
+                            dummy_prove::<Bn254, Rep3PrimeFieldShare<ark_bn254::Fr>>(
+                                &net0, &net1, pkey, matrices, witness,
+                            )
+                        };
+
+                        let gpu_prove = |pkey, matrices, witness| {
+                            dummy_prove::<Bn254, Rep3PrimeFieldShare<ark_bn254::Fr>>(
+                                &net0, &net1, pkey, matrices, witness,
+                            )
+                        };
+
+                        run_provers!(
+                            cpu_prove = cpu_prove,
+                            gpu_prove = gpu_prove,
+                            pkey = &zkey.1,
+                            matrices = &zkey.0,
+                            witness = x,
+                            silent = true
+                        );
+                    }
+                }));
+            }
+
+            threads.into_iter().for_each(|t| {
+                let _ = t.join().unwrap();
+            });
+        }
+    }
+
+    #[test]
     #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_poseidon_hash_bn254_rep3() {
         load_backend_from_env_and_set_device(0);
@@ -200,25 +360,14 @@ mod tests {
                         )
                     };
 
-                    if net0.id() == 0 {
-                        run_provers!(
-                            cpu_prove = cpu_prove,
-                            gpu_prove = gpu_prove,
-                            pkey = &zkey.1,
-                            matrices = &zkey.0,
-                            witness = x,
-                            silent = false
-                        );
-                    } else {
-                        run_provers!(
-                            cpu_prove = cpu_prove,
-                            gpu_prove = cpu_prove,
-                            pkey = &zkey.1,
-                            matrices = &zkey.0,
-                            witness = x,
-                            silent = true
-                        );
-                    }
+                    run_provers!(
+                        cpu_prove = cpu_prove,
+                        gpu_prove = gpu_prove,
+                        pkey = &zkey.1,
+                        matrices = &zkey.0,
+                        witness = x,
+                        silent = net0.id() != 0 // only print for the first party to avoid cluttering the output
+                    );
                 }));
             }
 
@@ -278,19 +427,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires building the icicle backend with -DCURVE=bls12_377"]
     fn proof_libsnark_penumbra_spend_bls12_377() {
         proof_libsnark_penumbra_bls12_377("penumbra_spend");
     }
 
     #[test]
-    #[ignore = "Requires building the icicle backend with -DCURVE=bls12_377"]
     fn proof_libsnark_penumbra_output_bls12_377() {
         proof_libsnark_penumbra_bls12_377("penumbra_output");
     }
 
     #[test]
-    #[ignore = "Requires building the icicle backend with -DCURVE=bls12_377"]
     fn proof_libsnark_penumbra_delegator_vote_bls12_377() {
         proof_libsnark_penumbra_bls12_377("penumbra_delegator_vote");
     }

@@ -40,7 +40,7 @@ pub trait CircomGroth16Prover<
 >: Send + Sized
 {
     /// The arithmetic share type
-    type ArithmeticShare;
+    type ArithmeticShare: Send;
 
     /// Represents a vector of field shares on the device
     type DeviceShares;
