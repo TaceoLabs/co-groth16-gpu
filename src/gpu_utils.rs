@@ -280,6 +280,15 @@ impl<
 }
 
 pub(crate) fn initialize_domain<F: FieldImpl<Config: NTTDomain<F>>>(max_size: usize) {
+    // Release the previous domain
+    let res = ntt::release_domain::<F>();
+    match res {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("Failed to release NTT domain: {}", e);
+        }
+    };
+
     // TODO CESAR: Handle better
     ntt::initialize_domain(
         ntt::get_root_of_unity::<F>(max_size.try_into().unwrap()),
