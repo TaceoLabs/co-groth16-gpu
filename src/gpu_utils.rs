@@ -16,8 +16,8 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
-pub const PRECOMPUTE_FACTOR_G1: i32 = 4;
-pub const PRECOMPUTE_FACTOR_G2: i32 = 1;
+pub const PRECOMPUTE_FACTOR_G1: i32 = 1;
+pub const PRECOMPUTE_FACTOR_G2: i32 = 8;
 pub const C: i32 = 0; // Lets icicle auto-pick
 pub const LARGE_BUCKET_FACTOR: i32 = 5;
 
@@ -48,10 +48,9 @@ fn upload_points_async<C: Curve + MSM<C>>(
         "MSM query slice cannot be empty for this prover flow"
     );
 
-    let points = from_host_slice_async(points, stream);
     let precompute_factor = precompute_factor.max(1);
     if precompute_factor == 1 {
-        return points;
+        return from_host_slice_async(points, stream);
     }
 
     let mut cfg = MSMConfig::default();
@@ -64,8 +63,12 @@ fn upload_points_async<C: Curve + MSM<C>>(
     let mut precomputed =
         DeviceVec::device_malloc_async(points.len() * (precompute_factor as usize), stream)
             .expect("Failed to allocate precomputed MSM bases");
-    precompute_bases::<C>(&points, &cfg, precomputed.as_mut_slice())
-        .expect("Failed to precompute MSM bases");
+    precompute_bases::<C>(
+        HostSlice::from_slice(points),
+        &cfg,
+        precomputed.as_mut_slice(),
+    )
+    .expect("Failed to precompute MSM bases");
     precomputed
 }
 
@@ -227,7 +230,7 @@ impl<
         let beta_g1 = ark_to_icicle_affine(&pk.beta_g1);
         let delta_g1 = ark_to_icicle_affine(&pk.delta_g1);
 
-        let (a_query, b_g1_query, b_g2_query, h_query, l_query) = rayon_join_5!(
+        let (a_query, b_g1_query, b_g2_query, h_query_host, l_query_host) = rayon_join_5!(
             || pk
                 .a_query
                 .iter()
@@ -270,29 +273,30 @@ impl<
         let b_g1_query_first = b_g1_query[0];
         let b_g2_query_first = b_g2_query[0];
 
-        let a_query_pub = a_query[1..num_instance_variables].to_vec();
-        let a_query_priv = a_query[num_instance_variables..].to_vec();
-        let b_g1_query_pub = b_g1_query[1..num_instance_variables].to_vec();
-        let b_g1_query_priv = b_g1_query[num_instance_variables..].to_vec();
-        let b_g2_query_pub = b_g2_query[1..num_instance_variables].to_vec();
-        let b_g2_query_priv = b_g2_query[num_instance_variables..].to_vec();
+        let a_query_pub_host = a_query[1..num_instance_variables].to_vec();
+        let a_query_priv_host = a_query[num_instance_variables..].to_vec();
+        let b_g1_query_pub_host = b_g1_query[1..num_instance_variables].to_vec();
+        let b_g1_query_priv_host = b_g1_query[num_instance_variables..].to_vec();
+        let b_g2_query_pub_host = b_g2_query[1..num_instance_variables].to_vec();
+        let b_g2_query_priv_host = b_g2_query[num_instance_variables..].to_vec();
 
         let mut streams = (0..8)
             .map(|_| IcicleStream::create().unwrap())
             .collect::<Vec<_>>();
 
-        let a_query_pub = upload_points_async(&a_query_pub, &streams[0], PRECOMPUTE_FACTOR_G1);
-        let a_query_priv = upload_points_async(&a_query_priv, &streams[1], PRECOMPUTE_FACTOR_G1);
+        let a_query_pub = upload_points_async(&a_query_pub_host, &streams[0], PRECOMPUTE_FACTOR_G1);
+        let a_query_priv =
+            upload_points_async(&a_query_priv_host, &streams[1], PRECOMPUTE_FACTOR_G1);
         let b_g1_query_pub =
-            upload_points_async(&b_g1_query_pub, &streams[2], PRECOMPUTE_FACTOR_G1);
+            upload_points_async(&b_g1_query_pub_host, &streams[2], PRECOMPUTE_FACTOR_G1);
         let b_g1_query_priv =
-            upload_points_async(&b_g1_query_priv, &streams[3], PRECOMPUTE_FACTOR_G1);
+            upload_points_async(&b_g1_query_priv_host, &streams[3], PRECOMPUTE_FACTOR_G1);
         let b_g2_query_pub =
-            upload_points_async(&b_g2_query_pub, &streams[4], PRECOMPUTE_FACTOR_G2);
+            upload_points_async(&b_g2_query_pub_host, &streams[4], PRECOMPUTE_FACTOR_G2);
         let b_g2_query_priv =
-            upload_points_async(&b_g2_query_priv, &streams[5], PRECOMPUTE_FACTOR_G2);
-        let h_query = upload_points_async(&h_query, &streams[6], PRECOMPUTE_FACTOR_G1);
-        let l_query = upload_points_async(&l_query, &streams[7], PRECOMPUTE_FACTOR_G1);
+            upload_points_async(&b_g2_query_priv_host, &streams[5], PRECOMPUTE_FACTOR_G2);
+        let h_query = upload_points_async(&h_query_host, &streams[6], PRECOMPUTE_FACTOR_G1);
+        let l_query = upload_points_async(&l_query_host, &streams[7], PRECOMPUTE_FACTOR_G1);
 
         streams.iter_mut().for_each(|stream| {
             stream.synchronize().unwrap();

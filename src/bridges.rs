@@ -65,7 +65,6 @@ where
     Ok(icicle_scalars)
 }
 
-// TODO CESAR: Batch
 pub(crate) fn ark_to_icicle_scalar<T, I>(ark_scalar: T) -> I
 where
     T: PrimeField,
