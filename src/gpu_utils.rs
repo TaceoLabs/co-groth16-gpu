@@ -16,9 +16,9 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
-pub const PRECOMPUTE_FACTOR: i32 = 16;
+pub const PRECOMPUTE_FACTOR: i32 = 4;
 pub const C: i32 = 0; // Lets icicle auto-pick
-pub const LARGE_BUCKET_FACTOR: i32 = 8;
+pub const LARGE_BUCKET_FACTOR: i32 = 5;
 
 #[macro_export]
 macro_rules! rayon_join_5 {
@@ -395,7 +395,7 @@ pub(crate) fn msm_async<
     cfg.stream_handle = **stream;
     cfg.is_async = true;
     cfg.precompute_factor = PRECOMPUTE_FACTOR;
-    cfg.c = C.max(0);
+    cfg.c = C;
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
 
