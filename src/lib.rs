@@ -8,7 +8,9 @@ pub mod mpc;
 mod utils;
 use icicle_runtime::runtime;
 
-pub use groth16_gpu::{CircomReduction, LibSnarkReduction, R1CSToQAP, Groth16, Rep3CoGroth16};
+pub use groth16_gpu::{
+    CircomReduction, Groth16, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16, prepare_bn254_key,
+};
 
 pub fn load_backend_from_env_and_set_device(device_idx: i32) {
     runtime::load_backend_from_env_or_default().unwrap();
@@ -39,7 +41,7 @@ mod tests {
 
     use std::{fs::File, io::BufReader, sync::Arc};
 
-    use crate::groth16_gpu::get_or_prepare_bn254_key;
+    use crate::groth16_gpu::{Bn254PreparedKey, prepare_bn254_key};
     use crate::{
         CircomReduction, LibSnarkReduction, Rep3CoGroth16, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
@@ -50,11 +52,14 @@ mod tests {
         cpu_prove = $cpu_prove:expr,
         gpu_prove = $gpu_prove:expr,
         pkey = $pkey:expr,
+        prepared_key = $prepared_key:expr,
         matrices = $matrices:expr,
         witness = $witness:expr,
         silent = $silent:expr
     ) => {{
             use std::time::Instant;
+            let prepared_key = $prepared_key;
+            let witness = $witness;
 
             // ---- CPU prove ----
             if !$silent {
@@ -62,7 +67,7 @@ mod tests {
                 println!("------------------- Proving (CPU) --------------------\n");
             }
             let t0 = Instant::now();
-            let _ = ($cpu_prove)($pkey, $matrices, $witness.clone())
+            let _ = ($cpu_prove)($pkey, $matrices, witness.clone())
                 .expect("CPU proof generation works");
             if !$silent {
                 println!("Time taken for CPU proving: {:?}\n", t0.elapsed());
@@ -71,7 +76,7 @@ mod tests {
                 println!("-------------- Proving (GPU before warm-up) --------------\n");
             }
             let t1 = Instant::now();
-            let _ = ($gpu_prove)($pkey, $matrices, $witness.clone())
+            let _ = ($gpu_prove)($pkey, prepared_key.clone(), $matrices, witness.clone())
                 .expect("GPU proof generation works (before warm-up)");
 
             if !$silent {
@@ -84,7 +89,7 @@ mod tests {
                 println!("-------------- Proving (GPU after warm-up) --------------\n");
             }
             let t2 = Instant::now();
-            let _ = ($gpu_prove)($pkey, $matrices, $witness)
+            let _ = ($gpu_prove)($pkey, prepared_key, $matrices, witness)
                 .expect("GPU proof generation works (after warm-up)");
 
             if !$silent {
@@ -101,6 +106,7 @@ mod tests {
         net0: &LocalNetwork,
         net1: &LocalNetwork,
         _pkey: &ProvingKey<P>,
+        _prepared_key: Option<Arc<Bn254PreparedKey>>,
         _matrices: &ConstraintMatrices<P::ScalarField>,
         _witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
     ) -> eyre::Result<()> {
@@ -147,13 +153,18 @@ mod tests {
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
 
-            get_or_prepare_bn254_key::<CircomReduction>(&pkey, matrices.num_constraints, matrices.num_instance_variables);
+            let prepared_key = prepare_bn254_key::<CircomReduction>(
+                &pkey,
+                matrices.num_constraints,
+                matrices.num_instance_variables,
+            );
 
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
                 gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
                 pkey = &pkey,
+                prepared_key = Some(Arc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
                 silent = false
@@ -180,13 +191,18 @@ mod tests {
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
 
-                        get_or_prepare_bn254_key::<CircomReduction>(&pkey, matrices.num_constraints, matrices.num_instance_variables);
+            let prepared_key = prepare_bn254_key::<CircomReduction>(
+                &pkey,
+                matrices.num_constraints,
+                matrices.num_instance_variables,
+            );
 
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
                 gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
                 pkey = &pkey,
+                prepared_key = Some(Arc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
                 silent = false
@@ -218,13 +234,18 @@ mod tests {
                 witness: witness[matrices.num_instance_variables..].to_vec(),
             };
 
-            get_or_prepare_bn254_key::<CircomReduction>(&pkey, matrices.num_constraints, matrices.num_instance_variables);
+            let prepared_key = prepare_bn254_key::<CircomReduction>(
+                &pkey,
+                matrices.num_constraints,
+                matrices.num_instance_variables,
+            );
 
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
                 gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
                 pkey = &pkey,
+                prepared_key = Some(Arc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
                 silent = false
@@ -278,16 +299,28 @@ mod tests {
                             >(&net0, &net1, pkey, matrices, witness)
                         };
 
-                        let gpu_prove = |pkey, matrices, witness| {
+                        let gpu_prove = |pkey, prepared_key, matrices, witness| {
                             Rep3CoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
-                                &net0, &net1, pkey, matrices, witness,
+                                &net0,
+                                &net1,
+                                pkey,
+                                prepared_key,
+                                matrices,
+                                witness,
                             )
                         };
+
+                        let prepared_key = prepare_bn254_key::<CircomReduction>(
+                            &zkey.1,
+                            zkey.0.num_constraints,
+                            zkey.0.num_instance_variables,
+                        );
 
                         run_provers!(
                             cpu_prove = cpu_prove,
                             gpu_prove = gpu_prove,
                             pkey = &zkey.1,
+                            prepared_key = Some(Arc::new(prepared_key)),
                             matrices = &zkey.0,
                             witness = x,
                             silent = false // only print for the first party to avoid cluttering the output
@@ -295,13 +328,18 @@ mod tests {
                     } else {
                         let cpu_prove = |pkey, matrices, witness| {
                             dummy_prove::<Bn254, Rep3PrimeFieldShare<ark_bn254::Fr>>(
-                                &net0, &net1, pkey, matrices, witness,
+                                &net0, &net1, pkey, None, matrices, witness,
                             )
                         };
 
-                        let gpu_prove = |pkey, matrices, witness| {
+                        let gpu_prove = |pkey, prepared_key, matrices, witness| {
                             dummy_prove::<Bn254, Rep3PrimeFieldShare<ark_bn254::Fr>>(
-                                &net0, &net1, pkey, matrices, witness,
+                                &net0,
+                                &net1,
+                                pkey,
+                                prepared_key,
+                                matrices,
+                                witness,
                             )
                         };
 
@@ -309,6 +347,7 @@ mod tests {
                             cpu_prove = cpu_prove,
                             gpu_prove = gpu_prove,
                             pkey = &zkey.1,
+                            prepared_key = None, // only the first party prepares the key to avoid redundant work
                             matrices = &zkey.0,
                             witness = x,
                             silent = true
@@ -363,9 +402,14 @@ mod tests {
                         >(&net0, &net1, pkey, matrices, witness)
                     };
 
-                    let gpu_prove = |pkey, matrices, witness| {
+                    let gpu_prove = |pkey, prepared_key, matrices, witness| {
                         Rep3CoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
-                            &net0, &net1, pkey, matrices, witness,
+                            &net0,
+                            &net1,
+                            pkey,
+                            prepared_key,
+                            matrices,
+                            witness,
                         )
                     };
 
@@ -373,6 +417,7 @@ mod tests {
                         cpu_prove = cpu_prove,
                         gpu_prove = gpu_prove,
                         pkey = &zkey.1,
+                        prepared_key = None,
                         matrices = &zkey.0,
                         witness = x,
                         silent = net0.id() != 0 // only print for the first party to avoid cluttering the output
@@ -429,6 +474,7 @@ mod tests {
                 co_groth16::Groth16::<Bls12_377>::plain_prove::<co_groth16::LibSnarkReduction>,
             gpu_prove = Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>,
             pkey = &pkey,
+            prepared_key = None,
             matrices = &matrices,
             witness = witness,
             silent = false

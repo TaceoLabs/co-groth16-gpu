@@ -110,7 +110,7 @@ pub trait ArkIcicleBridge {
     fn icicle_to_ark_g2(point: Affine<Self::IcicleG2>) -> Self::ArkG2Affine;
 }
 
-pub(crate) struct Bn254Bridge;
+pub struct Bn254Bridge;
 
 impl ArkIcicleBridge for Bn254Bridge {
     type ArkScalarField = ark_bn254::Fr;
