@@ -16,7 +16,8 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
-pub const PRECOMPUTE_FACTOR: i32 = 4;
+pub const PRECOMPUTE_FACTOR_G1: i32 = 4;
+pub const PRECOMPUTE_FACTOR_G2: i32 = 1;
 pub const C: i32 = 0; // Lets icicle auto-pick
 pub const LARGE_BUCKET_FACTOR: i32 = 5;
 
@@ -40,6 +41,7 @@ use crate::utils::root_of_unity_for_groth16;
 fn upload_points_async<C: Curve + MSM<C>>(
     points: &[Affine<C>],
     stream: &IcicleStream,
+    precompute_factor: i32,
 ) -> DeviceVec<Affine<C>> {
     assert!(
         !points.is_empty(),
@@ -47,16 +49,20 @@ fn upload_points_async<C: Curve + MSM<C>>(
     );
 
     let points = from_host_slice_async(points, stream);
+    let precompute_factor = precompute_factor.max(1);
+    if precompute_factor == 1 {
+        return points;
+    }
 
     let mut cfg = MSMConfig::default();
     cfg.stream_handle = **stream;
     cfg.is_async = true;
-    cfg.precompute_factor = PRECOMPUTE_FACTOR;
+    cfg.precompute_factor = precompute_factor;
     cfg.c = C;
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
     let mut precomputed =
-        DeviceVec::device_malloc_async(points.len() * (PRECOMPUTE_FACTOR as usize), stream)
+        DeviceVec::device_malloc_async(points.len() * (precompute_factor as usize), stream)
             .expect("Failed to allocate precomputed MSM bases");
     precompute_bases::<C>(&points, &cfg, precomputed.as_mut_slice())
         .expect("Failed to precompute MSM bases");
@@ -275,14 +281,18 @@ impl<
             .map(|_| IcicleStream::create().unwrap())
             .collect::<Vec<_>>();
 
-        let a_query_pub = upload_points_async(&a_query_pub, &streams[0]);
-        let a_query_priv = upload_points_async(&a_query_priv, &streams[1]);
-        let b_g1_query_pub = upload_points_async(&b_g1_query_pub, &streams[2]);
-        let b_g1_query_priv = upload_points_async(&b_g1_query_priv, &streams[3]);
-        let b_g2_query_pub = upload_points_async(&b_g2_query_pub, &streams[4]);
-        let b_g2_query_priv = upload_points_async(&b_g2_query_priv, &streams[5]);
-        let h_query = upload_points_async(&h_query, &streams[6]);
-        let l_query = upload_points_async(&l_query, &streams[7]);
+        let a_query_pub = upload_points_async(&a_query_pub, &streams[0], PRECOMPUTE_FACTOR_G1);
+        let a_query_priv = upload_points_async(&a_query_priv, &streams[1], PRECOMPUTE_FACTOR_G1);
+        let b_g1_query_pub =
+            upload_points_async(&b_g1_query_pub, &streams[2], PRECOMPUTE_FACTOR_G1);
+        let b_g1_query_priv =
+            upload_points_async(&b_g1_query_priv, &streams[3], PRECOMPUTE_FACTOR_G1);
+        let b_g2_query_pub =
+            upload_points_async(&b_g2_query_pub, &streams[4], PRECOMPUTE_FACTOR_G2);
+        let b_g2_query_priv =
+            upload_points_async(&b_g2_query_priv, &streams[5], PRECOMPUTE_FACTOR_G2);
+        let h_query = upload_points_async(&h_query, &streams[6], PRECOMPUTE_FACTOR_G1);
+        let l_query = upload_points_async(&l_query, &streams[7], PRECOMPUTE_FACTOR_G1);
 
         streams.iter_mut().for_each(|stream| {
             stream.synchronize().unwrap();
@@ -388,13 +398,14 @@ pub(crate) fn msm_async<
     points: &DeviceSlice<Affine<C>>,
     scalars: &DeviceSlice<F>,
     stream: &IcicleStream,
+    precompute_factor: i32,
 ) -> DeviceVec<Projective<C>> {
     let mut results: DeviceVec<Projective<C>> =
         DeviceVec::device_malloc_async(1, stream).expect("Failed to allocate device vector");
     let mut cfg = MSMConfig::default();
     cfg.stream_handle = **stream;
     cfg.is_async = true;
-    cfg.precompute_factor = PRECOMPUTE_FACTOR;
+    cfg.precompute_factor = precompute_factor.max(1);
     cfg.c = C;
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);

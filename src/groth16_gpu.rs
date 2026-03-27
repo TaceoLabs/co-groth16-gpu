@@ -1,5 +1,7 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
-use crate::gpu_utils::{from_host_slice, get_first, msm_async};
+use crate::gpu_utils::{
+    PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, from_host_slice, get_first, msm_async,
+};
 use ark_bn254::Bn254;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_relations::r1cs::ConstraintMatrices;
@@ -241,27 +243,57 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         // Compute A
         let (pub_acc_r_g1, priv_acc_r_g1) = (
-            msm_async(a_query_pub, &input_assignment[1..], stream_g1),
-            msm_async(a_query_priv, aux_assignment, stream_g1),
+            msm_async(
+                a_query_pub,
+                &input_assignment[1..],
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
+            msm_async(
+                a_query_priv,
+                aux_assignment,
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
         );
 
         // Compute B in G1
         let (pub_acc_s_g1, priv_acc_s_g1) = (
-            msm_async(b_g1_query_pub, &input_assignment[1..], stream_g1),
-            msm_async(b_g1_query_priv, aux_assignment, stream_g1),
+            msm_async(
+                b_g1_query_pub,
+                &input_assignment[1..],
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
+            msm_async(
+                b_g1_query_priv,
+                aux_assignment,
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
         );
 
         // Compute B in G2
         let (pub_acc_s_g2, priv_acc_s_g2) = (
-            msm_async(b_g2_query_pub, &input_assignment[1..], stream_g2),
-            msm_async(b_g2_query_priv, aux_assignment, stream_g2),
+            msm_async(
+                b_g2_query_pub,
+                &input_assignment[1..],
+                stream_g2,
+                PRECOMPUTE_FACTOR_G2,
+            ),
+            msm_async(
+                b_g2_query_priv,
+                aux_assignment,
+                stream_g2,
+                PRECOMPUTE_FACTOR_G2,
+            ),
         );
 
         // Compute msm(l_query, aux_assignment)
-        let l_acc = msm_async(l_query, aux_assignment, stream_g1);
+        let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, &h, stream_g1);
+        let h_acc = msm_async(h_query, &h, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
