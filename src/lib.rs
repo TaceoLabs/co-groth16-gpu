@@ -39,13 +39,42 @@ mod tests {
     use mpc_net::{Network, local::LocalNetwork};
     use rand::thread_rng;
 
-    use std::{fs::File, io::BufReader, sync::Arc};
+    use std::{
+        fs::File,
+        io::BufReader,
+        sync::{Arc, Once},
+    };
 
     use crate::groth16_gpu::{Bn254PreparedKey, prepare_bn254_key};
     use crate::{
         CircomReduction, LibSnarkReduction, Rep3CoGroth16, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
     };
+
+    static TRACING_ONCE: Once = Once::new();
+
+    fn install_tracing() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::{EnvFilter, fmt};
+
+        let fmt_layer = fmt::layer()
+            .with_target(false)
+            .with_line_number(false)
+            .with_span_events(FmtSpan::CLOSE | FmtSpan::ENTER);
+        let filter_layer = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new("oimt=info"))
+            .unwrap();
+
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(fmt_layer)
+            .init();
+    }
+
+    fn install_tracing_once() {
+        TRACING_ONCE.call_once(install_tracing);
+    }
 
     macro_rules! run_provers {
         (
@@ -58,46 +87,45 @@ mod tests {
         silent = $silent:expr
     ) => {{
             use std::time::Instant;
+            install_tracing_once();
             let prepared_key = $prepared_key;
             let witness = $witness;
 
             // ---- CPU prove ----
             if !$silent {
-                println!("\n");
-                println!("------------------- Proving (CPU) --------------------\n");
+                tracing::info!("------------------- Proving (CPU) --------------------");
             }
             let t0 = Instant::now();
             let _ = ($cpu_prove)($pkey, $matrices, witness.clone())
                 .expect("CPU proof generation works");
             if !$silent {
-                println!("Time taken for CPU proving: {:?}\n", t0.elapsed());
+                tracing::info!("Time taken for CPU proving: {:?}", t0.elapsed());
 
                 // ---- GPU warm-up ----
-                println!("-------------- Proving (GPU before warm-up) --------------\n");
+                tracing::info!("-------------- Proving (GPU before warm-up) --------------");
             }
             let t1 = Instant::now();
             let _ = ($gpu_prove)($pkey, prepared_key.clone(), $matrices, witness.clone())
                 .expect("GPU proof generation works (before warm-up)");
 
             if !$silent {
-                println!(
+                tracing::info!(
                     "Time taken for GPU proving (before warm-up): {:?}\n",
                     t1.elapsed()
                 );
 
                 // ---- GPU final prove ----
-                println!("-------------- Proving (GPU after warm-up) --------------\n");
+                tracing::info!("-------------- Proving (GPU after warm-up) --------------");
             }
             let t2 = Instant::now();
             let _ = ($gpu_prove)($pkey, prepared_key, $matrices, witness)
                 .expect("GPU proof generation works (after warm-up)");
 
             if !$silent {
-                println!(
+                tracing::info!(
                     "Time taken for GPU proving (after warm-up): {:?}\n",
                     t2.elapsed()
                 );
-                println!("\n");
             }
         }};
     }

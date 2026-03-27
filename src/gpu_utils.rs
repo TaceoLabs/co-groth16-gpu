@@ -16,7 +16,7 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
-pub const PRECOMPUTE_FACTOR_G1: i32 = 1;
+pub const PRECOMPUTE_FACTOR_G1: i32 = 8;
 pub const PRECOMPUTE_FACTOR_G2: i32 = 8;
 pub const C: i32 = 0; // Lets icicle auto-pick
 pub const LARGE_BUCKET_FACTOR: i32 = 5;
@@ -357,7 +357,7 @@ pub(crate) fn initialize_domain<F: FieldImpl<Config: NTTDomain<F>> + 'static>(ma
     match res {
         Ok(_) => (),
         Err(e) => {
-            eprintln!("Warning: Failed to release existing NTT domain: {e}");
+            tracing::info!("Warning: Failed to release existing NTT domain: {e}");
         }
     }
 

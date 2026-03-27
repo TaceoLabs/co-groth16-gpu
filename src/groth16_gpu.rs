@@ -103,6 +103,9 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         DeviceVec<B::IcicleScalarField>,
         T::DeviceShares,
     )> {
+        let setup_timer = std::time::Instant::now();
+
+        let eval_timer = std::time::Instant::now();
         let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
             id,
             matrices,
@@ -111,10 +114,23 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             R::requires_eval_c(),
             domain_size,
         );
+        let eval_elapsed = eval_timer.elapsed();
 
+        let witness_timer = std::time::Instant::now();
         let private_witness = T::shares_to_device::<B, U>(private_witness);
+        let witness_elapsed = witness_timer.elapsed();
 
+        let public_timer = std::time::Instant::now();
         let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
+        let public_elapsed = public_timer.elapsed();
+
+        tracing::info!(
+            "Setup timings: evaluate_constraints={} ms, witness_to_device={} ms, public_to_device={} ms, total={} ms",
+            eval_elapsed.as_millis(),
+            witness_elapsed.as_millis(),
+            public_elapsed.as_millis(),
+            setup_timer.elapsed().as_millis()
+        );
 
         Ok((eval_a, eval_b, eval_c, public_inputs, private_witness))
     }
@@ -144,7 +160,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             pkey.num_constraints,
             pkey.domain_size,
         )?;
-        println!(
+        tracing::info!(
             "Witness map computation took {} ms",
             timer_start.elapsed().as_millis()
         );
@@ -156,8 +172,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let private_witness_half_shares = T::to_half_share_vec(&private_witness);
 
-        let timer_start = std::time::Instant::now();
-        let out = Self::create_proof_with_assignment(
+        Self::create_proof_with_assignment(
             net0,
             net1,
             state0,
@@ -168,12 +183,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             h,
             &public_inputs,
             &private_witness_half_shares,
-        );
-        println!(
-            "Proof with assignment took {} ms",
-            timer_start.elapsed().as_millis()
-        );
-        out
+        )
     }
 
     fn calculate_coeff<C>(
@@ -207,6 +217,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         input_assignment: &DeviceVec<B::IcicleScalarField>,
         aux_assignment: &DeviceVec<B::IcicleScalarField>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+        let total_timer = std::time::Instant::now();
         let ProvingKey {
             vk,
             beta_g1,
@@ -241,6 +252,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let stream_g1 = &proof_streams.g1;
         let stream_g2 = &proof_streams.g2;
 
+        let msm_timer = std::time::Instant::now();
         // Compute A
         let (pub_acc_r_g1, priv_acc_r_g1) = (
             msm_async(
@@ -297,7 +309,12 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
+        tracing::info!(
+            "MSM + stream sync took {} ms",
+            msm_timer.elapsed().as_millis()
+        );
 
+        let coeff_timer = std::time::Instant::now();
         let pub_acc_r_g1 = get_first(&pub_acc_r_g1);
         let priv_acc_r_g1 = get_first(&priv_acc_r_g1);
         let pub_acc_s_g1 = get_first(&pub_acc_s_g1);
@@ -343,7 +360,12 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         // Compute r * s
         let rs = T::local_mul::<B>(&r, &s, state0);
         let r_s_delta_g1 = delta_g1 * rs;
+        tracing::info!(
+            "Coefficient assembly took {} ms",
+            coeff_timer.elapsed().as_millis()
+        );
 
+        let open_timer = std::time::Instant::now();
         let g_a = r_g1;
         let g1_b = s_g1;
 
@@ -367,6 +389,14 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let (g_c_opened, g2_b_opened) = rayon::join(
             || T::open_half_point_g1::<_, B>(g_c.into(), net0, state0),
             || T::open_half_point_g2::<_, B>(g2_b, net1, state1),
+        );
+        tracing::info!(
+            "Point openings took {} ms",
+            open_timer.elapsed().as_millis()
+        );
+        tracing::info!(
+            "Proof with assignment took {} ms",
+            total_timer.elapsed().as_millis()
         );
 
         Ok(Proof {
