@@ -8,7 +8,7 @@ pub mod mpc;
 mod utils;
 use icicle_runtime::runtime;
 
-pub use groth16_gpu::{CircomReduction, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16};
+pub use groth16_gpu::{CircomReduction, LibSnarkReduction, R1CSToQAP, Groth16, Rep3CoGroth16};
 
 pub fn load_backend_from_env_and_set_device(device_idx: i32) {
     runtime::load_backend_from_env_or_default().unwrap();
@@ -39,6 +39,7 @@ mod tests {
 
     use std::{fs::File, io::BufReader, sync::Arc};
 
+    use crate::groth16_gpu::get_or_prepare_bn254_key;
     use crate::{
         CircomReduction, LibSnarkReduction, Rep3CoGroth16, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
@@ -146,6 +147,8 @@ mod tests {
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
 
+            get_or_prepare_bn254_key::<CircomReduction>(&pkey, matrices.num_constraints, matrices.num_instance_variables);
+
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
@@ -176,6 +179,9 @@ mod tests {
                 public_inputs: public_input.clone(),
                 witness: witness.values[matrices.num_instance_variables..].to_vec(),
             };
+
+                        get_or_prepare_bn254_key::<CircomReduction>(&pkey, matrices.num_constraints, matrices.num_instance_variables);
+
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
@@ -211,6 +217,9 @@ mod tests {
                 public_inputs: public_input.clone(),
                 witness: witness[matrices.num_instance_variables..].to_vec(),
             };
+
+            get_or_prepare_bn254_key::<CircomReduction>(&pkey, matrices.num_constraints, matrices.num_instance_variables);
+
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,

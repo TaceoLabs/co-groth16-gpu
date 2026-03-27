@@ -1,20 +1,17 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
-use crate::gpu_utils::{
-    from_host_slice, get_first_affine, get_first_projective, initialize_domain, msm_async,
-};
+use crate::gpu_utils::{from_host_slice, initialize_domain, msm_async};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_relations::r1cs::ConstraintMatrices;
 use co_circom_types::SharedWitness;
 use eyre::Result;
-use icicle_core::curve::{Affine, Curve};
-use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
+use icicle_core::curve::{Affine, Curve, Projective};
+use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice, HostSlice};
 use icicle_runtime::stream::IcicleStream;
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_net::Network;
-use std::marker::PhantomData;
-use std::mem::transmute;
+use std::{cell::RefCell, collections::HashMap, marker::PhantomData, mem::transmute, rc::Rc};
 
 use icicle_core::msm::MSM;
 
@@ -51,22 +48,142 @@ pub struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleS
     phantom_data: PhantomData<(B, T)>,
 }
 
+type Bn254PreparedKey = ProvingKey<
+    <Bn254Bridge as ArkIcicleBridge>::IcicleScalarField,
+    <Bn254Bridge as ArkIcicleBridge>::IcicleG1,
+    <Bn254Bridge as ArkIcicleBridge>::IcicleG2,
+>;
+
+type Bls12_377PreparedKey = ProvingKey<
+    <Bls12_377Bridge as ArkIcicleBridge>::IcicleScalarField,
+    <Bls12_377Bridge as ArkIcicleBridge>::IcicleG1,
+    <Bls12_377Bridge as ArkIcicleBridge>::IcicleG2,
+>;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct PreparedKeyCacheId {
+    pkey_addr: usize,
+    num_constraints: usize,
+    num_instance_variables: usize,
+    eval_c: bool,
+    a_query_len: usize,
+    b_g1_query_len: usize,
+    b_g2_query_len: usize,
+    h_query_len: usize,
+    l_query_len: usize,
+}
+
+fn make_prepared_key_cache_id<P: ark_ec::pairing::Pairing>(
+    pkey: &ark_groth16::ProvingKey<P>,
+    num_constraints: usize,
+    num_instance_variables: usize,
+    eval_c: bool,
+) -> PreparedKeyCacheId {
+    PreparedKeyCacheId {
+        pkey_addr: (pkey as *const _) as usize,
+        num_constraints,
+        num_instance_variables,
+        eval_c,
+        a_query_len: pkey.a_query.len(),
+        b_g1_query_len: pkey.b_g1_query.len(),
+        b_g2_query_len: pkey.b_g2_query.len(),
+        h_query_len: pkey.h_query.len(),
+        l_query_len: pkey.l_query.len(),
+    }
+}
+
+thread_local! {
+    static BN254_PREPARED_KEY_CACHE: RefCell<HashMap<PreparedKeyCacheId, Rc<Bn254PreparedKey>>> =
+        RefCell::new(HashMap::new());
+    static BLS12_377_PREPARED_KEY_CACHE: RefCell<HashMap<PreparedKeyCacheId, Rc<Bls12_377PreparedKey>>> =
+        RefCell::new(HashMap::new());
+    static PROOF_STREAMS: RefCell<ProofStreams> = RefCell::new(ProofStreams::new());
+}
+
+struct ProofStreams {
+    g1: IcicleStream,
+    g2: IcicleStream,
+}
+
+impl ProofStreams {
+    fn new() -> Self {
+        Self {
+            g1: IcicleStream::create().unwrap(),
+            g2: IcicleStream::create().unwrap(),
+        }
+    }
+}
+
+impl Drop for ProofStreams {
+    fn drop(&mut self) {
+        let _ = self.g1.destroy();
+        let _ = self.g2.destroy();
+    }
+}
+
+pub fn get_or_prepare_bn254_key<R: R1CSToQAP>(
+    pkey: &ark_groth16::ProvingKey<ark_bn254::Bn254>,
+    num_constraints: usize,
+    num_instance_variables: usize,
+) -> Rc<Bn254PreparedKey> {
+    let cache_id = make_prepared_key_cache_id(pkey, num_constraints, num_instance_variables, R::requires_eval_c());
+    BN254_PREPARED_KEY_CACHE.with(|cache| {
+        if let Some(prepared) = cache.borrow().get(&cache_id).cloned() {
+            return prepared;
+        }
+
+        let prepared = Rc::new(ProvingKey::from_ark(
+            pkey,
+            num_constraints,
+            num_instance_variables,
+            R::requires_eval_c(),
+        ));
+        cache.borrow_mut().insert(cache_id, Rc::clone(&prepared));
+        prepared
+    })
+}
+
+pub fn get_or_prepare_bls12_377_key<R: R1CSToQAP>(
+    pkey: &ark_groth16::ProvingKey<ark_bls12_377::Bls12_377>,
+    num_constraints: usize,
+    num_instance_variables: usize,
+) -> Rc<Bls12_377PreparedKey> {
+    let cache_id = make_prepared_key_cache_id(pkey, num_constraints, num_instance_variables, R::requires_eval_c());
+    BLS12_377_PREPARED_KEY_CACHE.with(|cache| {
+        if let Some(prepared) = cache.borrow().get(&cache_id).cloned() {
+            return prepared;
+        }
+
+        let prepared = Rc::new(ProvingKey::from_ark(
+            pkey,
+            num_constraints,
+            num_instance_variables,
+            R::requires_eval_c(),
+        ));
+        cache.borrow_mut().insert(cache_id, Rc::clone(&prepared));
+        prepared
+    })
+}
+
 impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16Icicle<B, T> {
     fn setup<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static, R: R1CSToQAP>(
         id: <T::State as MpcState>::PartyID,
-        pkey: &co_groth16::ProvingKey<B::ArkPairing>,
+        prepared_key: Rc<ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>>,
         matrices: &ConstraintMatrices<B::ArkScalarField>,
         private_witness: &Vec<U::ArithmeticShare>,
         public_inputs: &Vec<B::ArkScalarField>,
         domain_size: usize,
     ) -> eyre::Result<(
-        ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
+        Rc<ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>>,
         T::DeviceShares,
         T::DeviceShares,
         Option<DeviceVec<B::IcicleScalarField>>,
         DeviceVec<B::IcicleScalarField>,
         T::DeviceShares,
-    )> {
+    )>
+    where
+        B::IcicleScalarField: 'static,
+    {
         let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
             id,
             matrices,
@@ -80,16 +197,16 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let private_witness = T::shares_to_device::<B, U>(private_witness);
 
-        let key = ProvingKey::from_ark(
-            pkey,
-            matrices.num_constraints,
-            matrices.num_instance_variables,
-            R::requires_eval_c(),
-        );
-
         let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
 
-        Ok((key, eval_a, eval_b, eval_c, public_inputs, private_witness))
+        Ok((
+            prepared_key,
+            eval_a,
+            eval_b,
+            eval_c,
+            public_inputs,
+            private_witness,
+        ))
     }
 
     /// Execute the Groth16 prover using the internal MPC driver.
@@ -184,11 +301,20 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             vk,
             beta_g1,
             delta_g1,
-            a_query,
-            b_g1_query,
-            b_g2_query,
+            a_query_first,
+            b_g1_query_first,
+            b_g2_query_first,
+            a_query_pub,
+            a_query_priv,
+            b_g1_query_pub,
+            b_g1_query_priv,
+            b_g2_query_pub,
+            b_g2_query_priv,
             l_query,
             h_query,
+            msm_precompute_factor,
+            msm_c,
+            msm_large_bucket_factor,
             ..
         } = pkey;
 
@@ -204,52 +330,194 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let id = state0.id();
 
-        let (mut stream_g1, mut stream_g2) = (
-            IcicleStream::create().unwrap(),
-            IcicleStream::create().unwrap(),
+        let precompute_factor = (*msm_precompute_factor) as usize;
+        debug_assert_eq!(
+            a_query_pub.len() / precompute_factor,
+            input_assignment.len() - 1
         );
-
-        let pub_len = input_assignment.len();
-
-        // Compute A
-        let (pub_acc_r_g1, priv_acc_r_g1) = (
-            msm_async(&a_query[1..pub_len], &input_assignment[1..], &stream_g1),
-            msm_async(&a_query[pub_len..], &aux_assignment, &stream_g1),
+        debug_assert_eq!(a_query_priv.len() / precompute_factor, aux_assignment.len());
+        debug_assert_eq!(
+            b_g1_query_pub.len() / precompute_factor,
+            input_assignment.len() - 1
         );
-
-        // Compute B in G1
-        let (pub_acc_s_g1, priv_acc_s_g1) = (
-            msm_async(&b_g1_query[1..pub_len], &input_assignment[1..], &stream_g1),
-            msm_async(&b_g1_query[pub_len..], &aux_assignment, &stream_g1),
+        debug_assert_eq!(
+            b_g1_query_priv.len() / precompute_factor,
+            aux_assignment.len()
         );
-
-        // Compute B in G2
-        let (pub_acc_s_g2, priv_acc_s_g2) = (
-            msm_async(&b_g2_query[1..pub_len], &input_assignment[1..], &stream_g2),
-            msm_async(&b_g2_query[pub_len..], &aux_assignment, &stream_g2),
+        debug_assert_eq!(
+            b_g2_query_pub.len() / precompute_factor,
+            input_assignment.len() - 1
         );
+        debug_assert_eq!(
+            b_g2_query_priv.len() / precompute_factor,
+            aux_assignment.len()
+        );
+        debug_assert_eq!(l_query.len() / precompute_factor, aux_assignment.len());
+        debug_assert_eq!(h_query.len() / precompute_factor, h.len());
 
-        // Compute msm(l_query, aux_assignment)
-        let l_acc = msm_async(l_query, aux_assignment, &stream_g1);
+        let (
+            pub_acc_r_g1,
+            priv_acc_r_g1,
+            pub_acc_s_g1,
+            priv_acc_s_g1,
+            pub_acc_s_g2,
+            priv_acc_s_g2,
+            l_acc,
+            h_acc,
+        ) = PROOF_STREAMS.with(|streams| {
+            let mut streams = streams.borrow_mut();
+            let ProofStreams {
+                g1: stream_g1,
+                g2: stream_g2,
+            } = &mut *streams;
 
-        // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, &h, &stream_g1);
+            // Compute A
+            let (pub_acc_r_g1, priv_acc_r_g1) = (
+                msm_async(
+                    a_query_pub,
+                    &input_assignment[1..],
+                    *msm_precompute_factor,
+                    *msm_c,
+                    *msm_large_bucket_factor,
+                    stream_g1,
+                ),
+                msm_async(
+                    a_query_priv,
+                    aux_assignment,
+                    *msm_precompute_factor,
+                    *msm_c,
+                    *msm_large_bucket_factor,
+                    stream_g1,
+                ),
+            );
 
-        stream_g1.synchronize().unwrap();
-        stream_g2.synchronize().unwrap();
+            // Compute B in G1
+            let (pub_acc_s_g1, priv_acc_s_g1) = (
+                msm_async(
+                    b_g1_query_pub,
+                    &input_assignment[1..],
+                    *msm_precompute_factor,
+                    *msm_c,
+                    *msm_large_bucket_factor,
+                    stream_g1,
+                ),
+                msm_async(
+                    b_g1_query_priv,
+                    aux_assignment,
+                    *msm_precompute_factor,
+                    *msm_c,
+                    *msm_large_bucket_factor,
+                    stream_g1,
+                ),
+            );
 
-        stream_g1.destroy().unwrap();
-        stream_g2.destroy().unwrap();
+            // Compute B in G2
+            let (pub_acc_s_g2, priv_acc_s_g2) = (
+                msm_async(
+                    b_g2_query_pub,
+                    &input_assignment[1..],
+                    *msm_precompute_factor,
+                    *msm_c,
+                    *msm_large_bucket_factor,
+                    stream_g2,
+                ),
+                msm_async(
+                    b_g2_query_priv,
+                    aux_assignment,
+                    *msm_precompute_factor,
+                    *msm_c,
+                    *msm_large_bucket_factor,
+                    stream_g2,
+                ),
+            );
+
+            // Compute msm(l_query, aux_assignment)
+            let l_acc = msm_async(
+                l_query,
+                aux_assignment,
+                *msm_precompute_factor,
+                *msm_c,
+                *msm_large_bucket_factor,
+                stream_g1,
+            );
+
+            // Compute msm(h_query, h)
+            let h_acc = msm_async(
+                h_query,
+                &h,
+                *msm_precompute_factor,
+                *msm_c,
+                *msm_large_bucket_factor,
+                stream_g1,
+            );
+
+            let mut pub_acc_r_g1_h: [Projective<B::IcicleG1>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG1>::zero());
+            let mut priv_acc_r_g1_h: [Projective<B::IcicleG1>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG1>::zero());
+            let mut pub_acc_s_g1_h: [Projective<B::IcicleG1>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG1>::zero());
+            let mut priv_acc_s_g1_h: [Projective<B::IcicleG1>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG1>::zero());
+            let mut pub_acc_s_g2_h: [Projective<B::IcicleG2>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG2>::zero());
+            let mut priv_acc_s_g2_h: [Projective<B::IcicleG2>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG2>::zero());
+            let mut l_acc_h: [Projective<B::IcicleG1>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG1>::zero());
+            let mut h_acc_h: [Projective<B::IcicleG1>; 1] =
+                std::array::from_fn(|_| Projective::<B::IcicleG1>::zero());
+
+            pub_acc_r_g1
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut pub_acc_r_g1_h), stream_g1)
+                .unwrap();
+            priv_acc_r_g1
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut priv_acc_r_g1_h), stream_g1)
+                .unwrap();
+            pub_acc_s_g1
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut pub_acc_s_g1_h), stream_g1)
+                .unwrap();
+            priv_acc_s_g1
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut priv_acc_s_g1_h), stream_g1)
+                .unwrap();
+            l_acc
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut l_acc_h), stream_g1)
+                .unwrap();
+            h_acc
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut h_acc_h), stream_g1)
+                .unwrap();
+
+            pub_acc_s_g2
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut pub_acc_s_g2_h), stream_g2)
+                .unwrap();
+            priv_acc_s_g2
+                .copy_to_host_async(HostSlice::from_mut_slice(&mut priv_acc_s_g2_h), stream_g2)
+                .unwrap();
+
+            stream_g1.synchronize().unwrap();
+            stream_g2.synchronize().unwrap();
+
+            (
+                pub_acc_r_g1_h[0],
+                priv_acc_r_g1_h[0],
+                pub_acc_s_g1_h[0],
+                priv_acc_s_g1_h[0],
+                pub_acc_s_g2_h[0],
+                priv_acc_s_g2_h[0],
+                l_acc_h[0],
+                h_acc_h[0],
+            )
+        });
 
         let r_hs = T::to_half_share(&r);
         let r_g1 = delta_g1 * r_hs;
         let r_g1 = Self::calculate_coeff::<B::IcicleG1>(
             id,
             r_g1.into(),
-            get_first_affine(a_query).unwrap(),
+            *a_query_first,
             *alpha_g1,
-            get_first_projective(&pub_acc_r_g1).unwrap().into(),
-            get_first_projective(&priv_acc_r_g1).unwrap().into(),
+            pub_acc_r_g1.into(),
+            priv_acc_r_g1.into(),
         );
 
         // In original implementation this is skipped if r==0, however r is shared in our case
@@ -258,25 +526,21 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let s_g1 = Self::calculate_coeff::<B::IcicleG1>(
             id,
             s_g1.into(),
-            get_first_affine(&b_g1_query).unwrap(),
+            *b_g1_query_first,
             *beta_g1,
-            get_first_projective(&pub_acc_s_g1).unwrap().into(),
-            get_first_projective(&priv_acc_s_g1).unwrap().into(),
+            pub_acc_s_g1.into(),
+            priv_acc_s_g1.into(),
         );
 
         let s_g2 = delta_g2 * s_hs;
         let s_g2 = Self::calculate_coeff::<B::IcicleG2>(
             id,
             s_g2.into(),
-            get_first_affine(&b_g2_query).unwrap(),
+            *b_g2_query_first,
             *beta_g2,
-            get_first_projective(&pub_acc_s_g2).unwrap().into(),
-            get_first_projective(&priv_acc_s_g2).unwrap().into(),
+            pub_acc_s_g2.into(),
+            priv_acc_s_g2.into(),
         );
-
-        let l_acc = get_first_projective(&l_acc).unwrap();
-
-        let h_acc = get_first_projective(&h_acc).unwrap();
 
         // Compute r * s
         let rs = T::local_mul::<B>(&r, &s, state0);
@@ -287,7 +551,10 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let (g_a_opened, r_g1_b) = rayon::join(
             || T::open_half_point_g1::<_, B>(g_a, net0, state0).expect("Failed to open g_a"),
-            || T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1).expect("Failed to scalar mul g1_b with r")
+            || {
+                T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1)
+                    .expect("Failed to scalar mul g1_b with r")
+            },
         );
 
         let s_g_a = g_a_opened.to_projective() * s_hs;
@@ -395,13 +662,14 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                 public_inputs
             );
 
+            let prepared_key = get_or_prepare_bn254_key::<R>(key, matrices.num_constraints, matrices.num_instance_variables);
             let (key, mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
                 CoGroth16Icicle::<Bn254Bridge, PlainGroth16Driver>::setup::<
                     co_groth16::mpc::PlainGroth16Driver,
                     R,
                 >(
                     0, // id irrelevant in the
-                    key,
+                    prepared_key,
                     matrices,
                     private_witness,
                     public_inputs,
@@ -417,7 +685,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
-                    &key,
+                    key.as_ref(),
                     private_witness,
                     &public_inputs,
                 )?;
@@ -443,13 +711,14 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                 public_inputs
             );
 
+            let prepared_key = get_or_prepare_bls12_377_key::<R>(key, matrices.num_constraints, matrices.num_instance_variables);
             let (key, mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
                 CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::setup::<
                     co_groth16::mpc::PlainGroth16Driver,
                     R,
                 >(
                     0, // id irrelevant in the
-                    key,
+                    prepared_key,
                     matrices,
                     private_witness,
                     public_inputs,
@@ -465,7 +734,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
-                    &key,
+                    key.as_ref(),
                     private_witness,
                     &public_inputs,
                 )?;
@@ -520,13 +789,14 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                 public_inputs
             );
 
+            let prepared_key = get_or_prepare_bn254_key::<R>(key, matrices.num_constraints, matrices.num_instance_variables);
             let (key, mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
                 CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::setup::<
                     co_groth16::mpc::Rep3Groth16Driver,
                     R,
                 >(
                     state0.id(),
-                    key,
+                    prepared_key,
                     matrices,
                     private_witness,
                     public_inputs,
@@ -542,7 +812,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
-                    &key,
+                    key.as_ref(),
                     private_witness,
                     &public_inputs,
                 )?;

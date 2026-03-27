@@ -1,10 +1,11 @@
 use eyre::Result;
-use icicle_core::vec_ops::{VecOpsConfig, mul_scalars, sub_scalars};
+use icicle_core::vec_ops::{VecOpsConfig, scalar_mul, sub_scalars};
 use icicle_runtime::{
     memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice},
     stream::IcicleStream,
 };
 use mpc_core::MpcState;
+use std::cell::RefCell;
 use tracing::instrument;
 
 use crate::{
@@ -15,6 +16,34 @@ use crate::{
 
 use ark_ff::{FftField, Field};
 use num_traits::One;
+
+struct ReductionStreams {
+    a: IcicleStream,
+    b: IcicleStream,
+    c: IcicleStream,
+}
+
+impl ReductionStreams {
+    fn new() -> Self {
+        Self {
+            a: IcicleStream::create().unwrap(),
+            b: IcicleStream::create().unwrap(),
+            c: IcicleStream::create().unwrap(),
+        }
+    }
+}
+
+impl Drop for ReductionStreams {
+    fn drop(&mut self) {
+        let _ = self.a.destroy();
+        let _ = self.b.destroy();
+        let _ = self.c.destroy();
+    }
+}
+
+thread_local! {
+    static REDUCTION_STREAMS: RefCell<ReductionStreams> = RefCell::new(ReductionStreams::new());
+}
 
 /// This trait is used to convert the secret-shared witness into a secret-shared QAP witness as part of a collaborative Groth16 proof.
 /// Refer to <https://docs.rs/ark-groth16/latest/ark_groth16/r1cs_to_qap/trait.R1CSToQAP.html> for more details on the plain version.
@@ -71,45 +100,48 @@ impl R1CSToQAP for CircomReduction {
         let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
         T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
 
-        let mut stream_c = IcicleStream::create().unwrap();
-        let mut c = T::local_mul_vec::<B>(eval_a, eval_b, state, &stream_c);
+        let result = REDUCTION_STREAMS.with(|streams| {
+            let mut streams = streams.borrow_mut();
+            let ReductionStreams {
+                a: stream_a,
+                b: stream_b,
+                c: stream_c,
+            } = &mut *streams;
 
-        // Computation of a
-        let mut stream_a = IcicleStream::create().unwrap();
-        T::ifft_in_place(eval_a, &stream_a, None);
-        T::distribute_powers_and_mul_by_const(eval_a, roots_to_power_domain, &stream_a);
-        T::fft_in_place(eval_a, &stream_a, None);
+            let mut c = T::local_mul_vec::<B>(eval_a, eval_b, state, stream_c);
 
-        // Computation of b
-        let mut stream_b = IcicleStream::create().unwrap();
-        T::ifft_in_place(eval_b, &stream_b, None);
-        T::distribute_powers_and_mul_by_const(eval_b, roots_to_power_domain, &stream_b);
-        T::fft_in_place(eval_b, &stream_b, None);
+            // Computation of a
+            T::ifft_in_place(eval_a, stream_a, None);
+            T::distribute_powers_and_mul_by_const(eval_a, roots_to_power_domain, stream_a);
+            T::fft_in_place(eval_a, stream_a, None);
 
-        // Computation of c
-        gpu_utils::ifft_inplace(&mut c, &stream_c, None);
-        T::distribute_powers_and_mul_by_const_hs(&mut c, roots_to_power_domain, &stream_c);
-        gpu_utils::fft_inplace(&mut c, &stream_c, None);
+            // Computation of b
+            T::ifft_in_place(eval_b, stream_b, None);
+            T::distribute_powers_and_mul_by_const(eval_b, roots_to_power_domain, stream_b);
+            T::fft_in_place(eval_b, stream_b, None);
 
-        stream_b.synchronize().unwrap();
+            // Computation of c
+            gpu_utils::ifft_inplace(&mut c, stream_c, None);
+            T::distribute_powers_and_mul_by_const_hs(&mut c, roots_to_power_domain, stream_c);
+            gpu_utils::fft_inplace(&mut c, stream_c, None);
 
-        let ab = T::local_mul_vec::<B>(eval_a, eval_b, state, &stream_a);
+            stream_b.synchronize().unwrap();
 
-        stream_a.synchronize().unwrap();
+            let ab = T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a);
 
-        stream_a.destroy().unwrap();
-        stream_b.destroy().unwrap();
+            stream_a.synchronize().unwrap();
 
-        let mut result = DeviceVec::device_malloc_async(c.len(), &stream_c)
-            .expect("Failed to allocate device vector");
+            let mut result = DeviceVec::device_malloc_async(c.len(), stream_c)
+                .expect("Failed to allocate device vector");
 
-        let mut cfg = VecOpsConfig::default();
-        cfg.stream_handle = *stream_c;
-        cfg.is_async = true;
-        sub_scalars(&ab, &c, result.as_mut_slice(), &cfg).unwrap();
+            let mut cfg = VecOpsConfig::default();
+            cfg.stream_handle = **stream_c;
+            cfg.is_async = true;
+            sub_scalars(&ab, &c, result.as_mut_slice(), &cfg).unwrap();
 
-        stream_c.synchronize().unwrap();
-        stream_c.destroy().unwrap();
+            stream_c.synchronize().unwrap();
+            result
+        });
 
         Ok(result)
     }
@@ -152,61 +184,63 @@ impl R1CSToQAP for LibSnarkReduction {
         let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
         T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
 
-        // Computation of a
-        let mut stream_a = IcicleStream::create().unwrap();
-        T::ifft_in_place(eval_a, &stream_a, None);
-        T::fft_in_place(eval_a, &stream_a, coset_gen);
-
-        // Computation of b
-        let mut stream_b = IcicleStream::create().unwrap();
-        T::ifft_in_place(eval_b, &stream_b, None);
-        T::fft_in_place(eval_b, &stream_b, coset_gen);
-
-        // Computation of c
-        let mut stream_c = IcicleStream::create().unwrap();
-        gpu_utils::ifft_inplace(c, &stream_c, None);
-        gpu_utils::fft_inplace(c, &stream_c, coset_gen);
-
-        stream_b.synchronize().unwrap();
-
-        let ab = T::local_mul_vec::<B>(eval_a, eval_b, state, &stream_a);
-
-        stream_a.synchronize().unwrap();
-
-        stream_a.destroy().unwrap();
-        stream_b.destroy().unwrap();
-
         // TODO CESAR
         let vanishing_polynomial_over_coset =
             (B::ArkScalarField::GENERATOR.pow(&[domain_size as u64]) - B::ArkScalarField::one())
                 .inverse()
                 .unwrap();
 
-        let vanishing_polynomial_over_coset = ark_to_icicle_scalar(vanishing_polynomial_over_coset);
+        let vanishing_polynomial_over_coset =
+            [ark_to_icicle_scalar(vanishing_polynomial_over_coset)];
 
-        let tmp = vec![vanishing_polynomial_over_coset; c.len()];
+        let result = REDUCTION_STREAMS.with(|streams| {
+            let mut streams = streams.borrow_mut();
+            let ReductionStreams {
+                a: stream_a,
+                b: stream_b,
+                c: stream_c,
+            } = &mut *streams;
 
-        let mut sub = DeviceVec::device_malloc_async(c.len(), &stream_c)
-            .expect("Failed to allocate device vector");
-        let mut result = DeviceVec::device_malloc_async(c.len(), &stream_c)
-            .expect("Failed to allocate device vector");
+            // Computation of a
+            T::ifft_in_place(eval_a, stream_a, None);
+            T::fft_in_place(eval_a, stream_a, coset_gen);
 
-        let mut cfg = VecOpsConfig::default();
-        cfg.stream_handle = *stream_c;
-        cfg.is_async = true;
-        sub_scalars(&ab, c, sub.as_mut_slice(), &cfg).unwrap();
-        mul_scalars(
-            &sub,
-            HostSlice::from_slice(&tmp),
-            result.as_mut_slice(),
-            &cfg,
-        )
-        .unwrap();
+            // Computation of b
+            T::ifft_in_place(eval_b, stream_b, None);
+            T::fft_in_place(eval_b, stream_b, coset_gen);
 
-        gpu_utils::ifft_inplace(result.as_mut_slice(), &stream_c, coset_gen);
+            // Computation of c
+            gpu_utils::ifft_inplace(c, stream_c, None);
+            gpu_utils::fft_inplace(c, stream_c, coset_gen);
 
-        stream_c.synchronize().unwrap();
-        stream_c.destroy().unwrap();
+            stream_b.synchronize().unwrap();
+
+            let ab = T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a);
+
+            stream_a.synchronize().unwrap();
+
+            let mut sub = DeviceVec::device_malloc_async(c.len(), stream_c)
+                .expect("Failed to allocate device vector");
+            let mut result = DeviceVec::device_malloc_async(c.len(), stream_c)
+                .expect("Failed to allocate device vector");
+
+            let mut cfg = VecOpsConfig::default();
+            cfg.stream_handle = **stream_c;
+            cfg.is_async = true;
+            sub_scalars(&ab, c, sub.as_mut_slice(), &cfg).unwrap();
+            scalar_mul(
+                HostSlice::from_slice(&vanishing_polynomial_over_coset),
+                &sub,
+                result.as_mut_slice(),
+                &cfg,
+            )
+            .unwrap();
+
+            gpu_utils::ifft_inplace(result.as_mut_slice(), stream_c, coset_gen);
+
+            stream_c.synchronize().unwrap();
+            result
+        });
 
         Ok(result)
     }
