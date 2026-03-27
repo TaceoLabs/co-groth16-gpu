@@ -1,14 +1,13 @@
-use std::ops::{Index, IndexMut};
+use std::ops::IndexMut;
 
 use ark_ff::FftField;
-use ark_ff::PrimeField;
 use ark_poly::EvaluationDomain;
 use ark_poly::GeneralEvaluationDomain;
 use icicle_core::curve::Affine;
 use icicle_core::vec_ops::VecOps;
 use icicle_core::{
     curve::{Curve, Projective},
-    msm::{MSM, MSMConfig, msm},
+    msm::{CUDA_MSM_LARGE_BUCKET_FACTOR, MSM, MSMConfig, msm, precompute_bases},
     ntt::{self, NTT, NTTConfig, NTTDir, NTTDomain, ntt_inplace},
     traits::{Arithmetic, FieldImpl, MontgomeryConvertible},
 };
@@ -16,6 +15,11 @@ use icicle_runtime::{
     memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice},
     stream::IcicleStream,
 };
+
+pub const PRECOMPUTE_FACTOR_G1: i32 = 8;
+pub const PRECOMPUTE_FACTOR_G2: i32 = 8;
+pub const C: i32 = 0; // Lets icicle auto-pick
+pub const LARGE_BUCKET_FACTOR: i32 = 5;
 
 #[macro_export]
 macro_rules! rayon_join_5 {
@@ -33,6 +37,40 @@ macro_rules! rayon_join_5 {
 
 use crate::bridges::{ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar};
 use crate::utils::root_of_unity_for_groth16;
+
+fn upload_points_async<C: Curve + MSM<C>>(
+    points: &[Affine<C>],
+    stream: &IcicleStream,
+    precompute_factor: i32,
+) -> DeviceVec<Affine<C>> {
+    assert!(
+        !points.is_empty(),
+        "MSM query slice cannot be empty for this prover flow"
+    );
+
+    let precompute_factor = precompute_factor.max(1);
+    if precompute_factor == 1 {
+        return from_host_slice_async(points, stream);
+    }
+
+    let mut cfg = MSMConfig::default();
+    cfg.stream_handle = **stream;
+    cfg.is_async = true;
+    cfg.precompute_factor = precompute_factor;
+    cfg.c = C;
+    cfg.ext
+        .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
+    let mut precomputed =
+        DeviceVec::device_malloc_async(points.len() * (precompute_factor as usize), stream)
+            .expect("Failed to allocate precomputed MSM bases");
+    precompute_bases::<C>(
+        HostSlice::from_slice(points),
+        &cfg,
+        precomputed.as_mut_slice(),
+    )
+    .expect("Failed to precompute MSM bases");
+    precomputed
+}
 
 pub fn from_host_slice<T>(slice: &[T]) -> DeviceVec<T> {
     let count = slice.len();
@@ -53,18 +91,6 @@ pub fn from_host_slice_async<T>(slice: &[T], stream: &IcicleStream) -> DeviceVec
     result
 }
 
-pub fn to_host_vec_ark_scalar<F: PrimeField>(slice: &DeviceSlice<F>) -> Vec<F> {
-    let mut host_vec = vec![F::zero(); slice.len()];
-    let host_slice = HostSlice::from_mut_slice(&mut host_vec);
-    slice.copy_to_host(host_slice).unwrap();
-    host_vec
-}
-
-pub fn get_first_ark_scalar<F: PrimeField>(vec: &DeviceSlice<F>) -> Option<F> {
-    let mut host_vec = to_host_vec_ark_scalar(vec.index(..1));
-    host_vec.pop()
-}
-
 pub fn to_host_vec_icicle_scalar<F: FieldImpl>(slice: &DeviceSlice<F>) -> Vec<F> {
     let mut host_vec = vec![F::zero(); slice.len()];
     let host_slice = HostSlice::from_mut_slice(&mut host_vec);
@@ -72,33 +98,12 @@ pub fn to_host_vec_icicle_scalar<F: FieldImpl>(slice: &DeviceSlice<F>) -> Vec<F>
     host_vec
 }
 
-pub fn get_first_icicle_scalar<F: FieldImpl>(vec: &DeviceSlice<F>) -> Option<F> {
-    let mut host_vec = to_host_vec_icicle_scalar(vec.index(..1));
-    host_vec.pop()
-}
-
-pub fn to_host_vec_projective<C: Curve>(slice: &DeviceSlice<Projective<C>>) -> Vec<Projective<C>> {
-    let mut host_vec = vec![Projective::<C>::zero(); slice.len()];
-    let host_slice = HostSlice::from_mut_slice(&mut host_vec);
-    slice.copy_to_host(host_slice).unwrap();
-    host_vec
-}
-
-pub fn to_host_vec_affine<C: Curve>(slice: &DeviceSlice<Affine<C>>) -> Vec<Affine<C>> {
-    let mut host_vec = vec![Affine::<C>::zero(); slice.len()];
-    let host_slice = HostSlice::from_mut_slice(&mut host_vec);
-    slice.copy_to_host(host_slice).unwrap();
-    host_vec
-}
-
-pub fn get_first_projective<C: Curve>(vec: &DeviceSlice<Projective<C>>) -> Option<Projective<C>> {
-    let mut host_vec = to_host_vec_projective(vec.index(..1));
-    host_vec.pop()
-}
-
-pub fn get_first_affine<C: Curve>(vec: &DeviceSlice<Affine<C>>) -> Option<Affine<C>> {
-    let mut host_vec = to_host_vec_affine(vec.index(..1));
-    host_vec.pop()
+pub fn get_first<C: Curve>(vec: &DeviceVec<Projective<C>>) -> Projective<C> {
+    let mut result = [Projective::<C>::zero(); 1];
+    let host_slice = HostSlice::from_mut_slice(&mut result);
+    vec.copy_to_host(host_slice)
+        .expect("Failed to copy data from device to host");
+    result[0]
 }
 
 pub(crate) struct Proof<
@@ -146,7 +151,7 @@ pub(crate) struct VerifyingKey<
     pub(crate) delta_g2: Affine<C2>,
 }
 
-pub(crate) struct ProvingKey<
+pub struct ProvingKey<
     F: FieldImpl<Config: VecOps<F> + NTT<F, F>>,
     C1: Curve<ScalarField = F>,
     C2: Curve<ScalarField = F>,
@@ -157,12 +162,24 @@ pub(crate) struct ProvingKey<
     pub(crate) beta_g1: Affine<C1>,
     /// The element `delta * G` in `E::G1`.
     pub(crate) delta_g1: Affine<C1>,
-    /// The elements `a_i * G` in `E::G1`.
-    pub(crate) a_query: DeviceVec<Affine<C1>>,
-    /// The elements `b_i * G` in `E::G1`.
-    pub(crate) b_g1_query: DeviceVec<Affine<C1>>,
-    /// The elements `b_i * H` in `E::G2`.
-    pub(crate) b_g2_query: DeviceVec<Affine<C2>>,
+    /// The first `a_i * G` query element used in A commitment.
+    pub(crate) a_query_first: Affine<C1>,
+    /// The first `b_i * G` query element used in B(G1) commitment.
+    pub(crate) b_g1_query_first: Affine<C1>,
+    /// The first `b_i * H` query element used in B(G2) commitment.
+    pub(crate) b_g2_query_first: Affine<C2>,
+    /// The public slice of `a_query` excluding index 0.
+    pub(crate) a_query_pub: DeviceVec<Affine<C1>>,
+    /// The private-witness slice of `a_query`.
+    pub(crate) a_query_priv: DeviceVec<Affine<C1>>,
+    /// The public slice of `b_g1_query` excluding index 0.
+    pub(crate) b_g1_query_pub: DeviceVec<Affine<C1>>,
+    /// The private-witness slice of `b_g1_query`.
+    pub(crate) b_g1_query_priv: DeviceVec<Affine<C1>>,
+    /// The public slice of `b_g2_query` excluding index 0.
+    pub(crate) b_g2_query_pub: DeviceVec<Affine<C2>>,
+    /// The private-witness slice of `b_g2_query`.
+    pub(crate) b_g2_query_priv: DeviceVec<Affine<C2>>,
     /// The elements `h_i * G` in `E::G1`.
     pub(crate) h_query: DeviceVec<Affine<C1>>,
     /// The elements `l_i * G` in `E::G1`.
@@ -170,12 +187,34 @@ pub(crate) struct ProvingKey<
     pub(crate) domain_size: usize,
     pub(crate) precomputed_roots: DeviceVec<F>,
     pub(crate) num_constraints: usize,
+    pub(crate) proof_streams: ProofStreams,
+}
+
+pub struct ProofStreams {
+    pub g1: IcicleStream,
+    pub g2: IcicleStream,
+}
+
+impl ProofStreams {
+    fn new() -> Self {
+        Self {
+            g1: IcicleStream::create().unwrap(),
+            g2: IcicleStream::create().unwrap(),
+        }
+    }
+}
+
+impl Drop for ProofStreams {
+    fn drop(&mut self) {
+        let _ = self.g1.destroy();
+        let _ = self.g2.destroy();
+    }
 }
 
 impl<
-    F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConvertible,
-    C1: Curve<ScalarField = F>,
-    C2: Curve<ScalarField = F>,
+    F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConvertible + 'static,
+    C1: Curve<ScalarField = F> + MSM<C1>,
+    C2: Curve<ScalarField = F> + MSM<C2>,
 > ProvingKey<F, C1, C2>
 {
     pub(crate) fn from_ark<P: ark_ec::pairing::Pairing>(
@@ -191,7 +230,7 @@ impl<
         let beta_g1 = ark_to_icicle_affine(&pk.beta_g1);
         let delta_g1 = ark_to_icicle_affine(&pk.delta_g1);
 
-        let (a_query, b_g1_query, b_g2_query, h_query, l_query) = rayon_join_5!(
+        let (a_query, b_g1_query, b_g2_query, h_query_host, l_query_host) = rayon_join_5!(
             || pk
                 .a_query
                 .iter()
@@ -219,19 +258,45 @@ impl<
                 .collect::<Vec<_>>(),
         );
 
-        let mut streams = (0..5)
+        assert!(
+            num_instance_variables > 0,
+            "num_instance_variables must be > 0"
+        );
+        assert!(
+            num_instance_variables <= a_query.len()
+                && num_instance_variables <= b_g1_query.len()
+                && num_instance_variables <= b_g2_query.len(),
+            "Proving key query vectors are shorter than num_instance_variables"
+        );
+
+        let a_query_first = a_query[0];
+        let b_g1_query_first = b_g1_query[0];
+        let b_g2_query_first = b_g2_query[0];
+
+        let a_query_pub_host = a_query[1..num_instance_variables].to_vec();
+        let a_query_priv_host = a_query[num_instance_variables..].to_vec();
+        let b_g1_query_pub_host = b_g1_query[1..num_instance_variables].to_vec();
+        let b_g1_query_priv_host = b_g1_query[num_instance_variables..].to_vec();
+        let b_g2_query_pub_host = b_g2_query[1..num_instance_variables].to_vec();
+        let b_g2_query_priv_host = b_g2_query[num_instance_variables..].to_vec();
+
+        let mut streams = (0..8)
             .map(|_| IcicleStream::create().unwrap())
             .collect::<Vec<_>>();
 
-        let a_query = from_host_slice_async(&a_query, &streams[0]);
-
-        let b_g1_query = from_host_slice_async(&b_g1_query, &streams[1]);
-
-        let b_g2_query = from_host_slice_async(&b_g2_query, &streams[2]);
-
-        let h_query = from_host_slice_async(&h_query, &streams[3]);
-
-        let l_query = from_host_slice_async(&l_query, &streams[4]);
+        let a_query_pub = upload_points_async(&a_query_pub_host, &streams[0], PRECOMPUTE_FACTOR_G1);
+        let a_query_priv =
+            upload_points_async(&a_query_priv_host, &streams[1], PRECOMPUTE_FACTOR_G1);
+        let b_g1_query_pub =
+            upload_points_async(&b_g1_query_pub_host, &streams[2], PRECOMPUTE_FACTOR_G1);
+        let b_g1_query_priv =
+            upload_points_async(&b_g1_query_priv_host, &streams[3], PRECOMPUTE_FACTOR_G1);
+        let b_g2_query_pub =
+            upload_points_async(&b_g2_query_pub_host, &streams[4], PRECOMPUTE_FACTOR_G2);
+        let b_g2_query_priv =
+            upload_points_async(&b_g2_query_priv_host, &streams[5], PRECOMPUTE_FACTOR_G2);
+        let h_query = upload_points_async(&h_query_host, &streams[6], PRECOMPUTE_FACTOR_G1);
+        let l_query = upload_points_async(&l_query_host, &streams[7], PRECOMPUTE_FACTOR_G1);
 
         streams.iter_mut().for_each(|stream| {
             stream.synchronize().unwrap();
@@ -243,6 +308,7 @@ impl<
         )
         .unwrap();
         let domain_size = domain.size();
+        initialize_domain::<F>(domain_size);
         let power = domain_size.ilog2() as usize;
 
         let root_of_unity = if eval_c {
@@ -267,29 +333,34 @@ impl<
             },
             beta_g1,
             delta_g1,
-            a_query,
-            b_g1_query,
-            b_g2_query,
+            a_query_first,
+            b_g1_query_first,
+            b_g2_query_first,
+            a_query_pub,
+            a_query_priv,
+            b_g1_query_pub,
+            b_g1_query_priv,
+            b_g2_query_pub,
+            b_g2_query_priv,
             h_query,
             l_query,
             domain_size,
             precomputed_roots,
             num_constraints,
+            proof_streams: ProofStreams::new(),
         }
     }
 }
 
-pub(crate) fn initialize_domain<F: FieldImpl<Config: NTTDomain<F>>>(max_size: usize) {
-    // Release the previous domain
+pub(crate) fn initialize_domain<F: FieldImpl<Config: NTTDomain<F>> + 'static>(max_size: usize) {
     let res = ntt::release_domain::<F>();
     match res {
-        Ok(()) => {}
+        Ok(_) => (),
         Err(e) => {
-            eprintln!("Failed to release NTT domain: {}", e);
+            tracing::info!("Warning: Failed to release existing NTT domain: {e}");
         }
-    };
+    }
 
-    // TODO CESAR: Handle better
     ntt::initialize_domain(
         ntt::get_root_of_unity::<F>(max_size.try_into().unwrap()),
         &ntt::NTTInitDomainConfig::default(),
@@ -331,21 +402,18 @@ pub(crate) fn msm_async<
     points: &DeviceSlice<Affine<C>>,
     scalars: &DeviceSlice<F>,
     stream: &IcicleStream,
+    precompute_factor: i32,
 ) -> DeviceVec<Projective<C>> {
-    let size = std::cmp::min(points.len(), scalars.len());
-
     let mut results: DeviceVec<Projective<C>> =
         DeviceVec::device_malloc_async(1, stream).expect("Failed to allocate device vector");
     let mut cfg = MSMConfig::default();
     cfg.stream_handle = **stream;
     cfg.is_async = true;
+    cfg.precompute_factor = precompute_factor.max(1);
+    cfg.c = C;
+    cfg.ext
+        .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
 
-    msm::<C>(
-        &scalars[..size],
-        &points[..size],
-        &cfg,
-        results.index_mut(..),
-    )
-    .expect("Failed to compute MSM");
+    msm::<C>(scalars, points, &cfg, results.index_mut(..)).expect("Failed to compute MSM");
     results
 }

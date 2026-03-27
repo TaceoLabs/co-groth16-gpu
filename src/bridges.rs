@@ -16,8 +16,6 @@ use icicle_core::{
 
 use icicle_runtime::stream::IcicleStream;
 
-use crate::gpu_utils::{from_host_slice, get_first_ark_scalar, get_first_icicle_scalar};
-
 pub(crate) fn ark_to_icicle_base<T, I>(ark: &T) -> I
 where
     T: ark_ff::Field,
@@ -67,33 +65,12 @@ where
     Ok(icicle_scalars)
 }
 
-pub(crate) fn icicle_to_ark_scalars<T, I>(
-    icicle_scalars: DeviceVec<I>,
-) -> eyre::Result<DeviceVec<T>>
-where
-    T: PrimeField,
-    I: FieldImpl + MontgomeryConvertible,
-{
-    let mut icicle_scalars = icicle_scalars;
-
-    // Convert to Montgomery representation using the Icicle type's conversion method
-    I::to_mont(&mut icicle_scalars, &IcicleStream::default());
-
-    // SAFETY: Reinterpreting Icicle-specific scalars as Arkworks field elements
-    let ark_scalars = unsafe { transmute::<DeviceVec<I>, DeviceVec<T>>(icicle_scalars) };
-
-    Ok(ark_scalars)
-}
-
-// TODO CESAR: Batch
 pub(crate) fn ark_to_icicle_scalar<T, I>(ark_scalar: T) -> I
 where
     T: PrimeField,
     I: FieldImpl + MontgomeryConvertible,
 {
-    let ark_scalars = vec![ark_scalar];
-    let ark_scalars = from_host_slice(&ark_scalars);
-    get_first_icicle_scalar(&ark_to_icicle_scalars(ark_scalars).unwrap()).unwrap()
+    I::from_bytes_le(&ark_scalar.into_bigint().to_bytes_le())
 }
 
 pub(crate) fn icicle_to_ark_scalar<T, I>(icicle_scalar: I) -> T
@@ -101,9 +78,7 @@ where
     T: PrimeField,
     I: FieldImpl + MontgomeryConvertible,
 {
-    let icicle_scalars = vec![icicle_scalar];
-    let icicle_scalars = from_host_slice(&icicle_scalars);
-    get_first_ark_scalar(&icicle_to_ark_scalars(icicle_scalars).unwrap()).unwrap()
+    T::from_le_bytes_mod_order(&icicle_scalar.to_bytes_le())
 }
 
 pub trait ArkIcicleBridge {
@@ -134,7 +109,7 @@ pub trait ArkIcicleBridge {
     fn icicle_to_ark_g2(point: Affine<Self::IcicleG2>) -> Self::ArkG2Affine;
 }
 
-pub(crate) struct Bn254Bridge;
+pub struct Bn254Bridge;
 
 impl ArkIcicleBridge for Bn254Bridge {
     type ArkScalarField = ark_bn254::Fr;

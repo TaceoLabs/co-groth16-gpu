@@ -23,13 +23,6 @@ use crate::{
     utils::{evaluate_constraint, evaluate_constraint_half_share},
 };
 
-macro_rules! rayon_join {
-    ($t1: expr, $t2: expr, $t3: expr) => {{
-        let ((x, y), z) = rayon::join(|| rayon::join($t1, $t2), $t3);
-        (x, y, z)
-    }};
-}
-
 pub use plain::PlainGroth16Driver;
 pub use rep3::Rep3Groth16Driver;
 // pub use shamir::ShamirGroth16Driver;
@@ -147,41 +140,38 @@ pub trait CircomGroth16Prover<
             transmute::<&<Self::State as MpcState>::PartyID, &<T::State as MpcState>::PartyID>(&id)
         };
 
-        let (eval_a, eval_b, eval_c) = rayon_join!(
-            || evaluate_constraint::<B::ArkPairing, T>(
-                id.clone(),
-                domain_size,
-                &matrices.a,
-                public_inputs,
-                private_witness,
-            ),
-            || evaluate_constraint::<B::ArkPairing, T>(
-                id.clone(),
-                domain_size,
-                &matrices.b,
-                public_inputs,
-                private_witness,
-            ),
-            || {
-                if eval_c {
-                    Some(evaluate_constraint_half_share::<B::ArkPairing, T>(
-                        id.clone(),
-                        domain_size,
-                        &matrices.c,
-                        public_inputs,
-                        private_witness,
-                    ))
-                } else {
-                    None
-                }
-            }
+        let eval_a = evaluate_constraint::<B::ArkPairing, T>(
+            id.clone(),
+            domain_size,
+            &matrices.a,
+            public_inputs,
+            private_witness,
         );
+        let eval_a = Self::shares_to_device::<B, T>(&eval_a);
 
-        (
-            Self::shares_to_device::<B, T>(&eval_a),
-            Self::shares_to_device::<B, T>(&eval_b),
-            eval_c.map(|c| Self::half_shares_to_device::<B, T>(&c)),
-        )
+        let eval_b = evaluate_constraint::<B::ArkPairing, T>(
+            id.clone(),
+            domain_size,
+            &matrices.b,
+            public_inputs,
+            private_witness,
+        );
+        let eval_b = Self::shares_to_device::<B, T>(&eval_b);
+
+        let eval_c = if eval_c {
+            let eval_c = evaluate_constraint_half_share::<B::ArkPairing, T>(
+                id.clone(),
+                domain_size,
+                &matrices.c,
+                public_inputs,
+                private_witness,
+            );
+            Some(Self::half_shares_to_device::<B, T>(&eval_c))
+        } else {
+            None
+        };
+
+        (eval_a, eval_b, eval_c)
     }
 
     /// Performs element-wise multiplication of two vectors of shared values.

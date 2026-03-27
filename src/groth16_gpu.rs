@@ -1,20 +1,20 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
 use crate::gpu_utils::{
-    from_host_slice, get_first_affine, get_first_projective, initialize_domain, msm_async,
+    PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, from_host_slice, get_first, msm_async,
 };
+use ark_bn254::Bn254;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use ark_relations::r1cs::ConstraintMatrices;
 use co_circom_types::SharedWitness;
 use eyre::Result;
-use icicle_core::curve::{Affine, Curve};
-use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
-use icicle_runtime::stream::IcicleStream;
+use icicle_core::curve::{Affine, Curve, Projective};
+use icicle_runtime::memory::DeviceVec;
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_net::Network;
-use std::marker::PhantomData;
-use std::mem::transmute;
+use std::sync::Arc;
+use std::{marker::PhantomData, mem::transmute};
 
 use icicle_core::msm::MSM;
 
@@ -51,22 +51,61 @@ pub struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleS
     phantom_data: PhantomData<(B, T)>,
 }
 
+pub type Bn254PreparedKey = ProvingKey<
+    <Bn254Bridge as ArkIcicleBridge>::IcicleScalarField,
+    <Bn254Bridge as ArkIcicleBridge>::IcicleG1,
+    <Bn254Bridge as ArkIcicleBridge>::IcicleG2,
+>;
+
+type Bls12_377PreparedKey = ProvingKey<
+    <Bls12_377Bridge as ArkIcicleBridge>::IcicleScalarField,
+    <Bls12_377Bridge as ArkIcicleBridge>::IcicleG1,
+    <Bls12_377Bridge as ArkIcicleBridge>::IcicleG2,
+>;
+
+pub fn prepare_bn254_key<R: R1CSToQAP>(
+    pkey: &ark_groth16::ProvingKey<Bn254>,
+    num_constraints: usize,
+    num_instance_variables: usize,
+) -> Bn254PreparedKey {
+    ProvingKey::from_ark(
+        pkey,
+        num_constraints,
+        num_instance_variables,
+        R::requires_eval_c(),
+    )
+}
+
+pub fn prepare_bls12_377_key<R: R1CSToQAP>(
+    pkey: &ark_groth16::ProvingKey<ark_bls12_377::Bls12_377>,
+    num_constraints: usize,
+    num_instance_variables: usize,
+) -> Bls12_377PreparedKey {
+    ProvingKey::from_ark(
+        pkey,
+        num_constraints,
+        num_instance_variables,
+        R::requires_eval_c(),
+    )
+}
+
 impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16Icicle<B, T> {
     fn setup<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static, R: R1CSToQAP>(
         id: <T::State as MpcState>::PartyID,
-        pkey: &co_groth16::ProvingKey<B::ArkPairing>,
         matrices: &ConstraintMatrices<B::ArkScalarField>,
         private_witness: &Vec<U::ArithmeticShare>,
         public_inputs: &Vec<B::ArkScalarField>,
         domain_size: usize,
     ) -> eyre::Result<(
-        ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
         T::DeviceShares,
         T::DeviceShares,
         Option<DeviceVec<B::IcicleScalarField>>,
         DeviceVec<B::IcicleScalarField>,
         T::DeviceShares,
     )> {
+        let setup_timer = std::time::Instant::now();
+
+        let eval_timer = std::time::Instant::now();
         let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
             id,
             matrices,
@@ -75,21 +114,25 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             R::requires_eval_c(),
             domain_size,
         );
+        let eval_elapsed = eval_timer.elapsed();
 
-        initialize_domain::<B::IcicleScalarField>(domain_size);
-
+        let witness_timer = std::time::Instant::now();
         let private_witness = T::shares_to_device::<B, U>(private_witness);
+        let witness_elapsed = witness_timer.elapsed();
 
-        let key = ProvingKey::from_ark(
-            pkey,
-            matrices.num_constraints,
-            matrices.num_instance_variables,
-            R::requires_eval_c(),
+        let public_timer = std::time::Instant::now();
+        let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
+        let public_elapsed = public_timer.elapsed();
+
+        tracing::info!(
+            "Setup timings: evaluate_constraints={} ms, witness_to_device={} ms, public_to_device={} ms, total={} ms",
+            eval_elapsed.as_millis(),
+            witness_elapsed.as_millis(),
+            public_elapsed.as_millis(),
+            setup_timer.elapsed().as_millis()
         );
 
-        let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
-
-        Ok((key, eval_a, eval_b, eval_c, public_inputs, private_witness))
+        Ok((eval_a, eval_b, eval_c, public_inputs, private_witness))
     }
 
     /// Execute the Groth16 prover using the internal MPC driver.
@@ -117,7 +160,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             pkey.num_constraints,
             pkey.domain_size,
         )?;
-        println!(
+        tracing::info!(
             "Witness map computation took {} ms",
             timer_start.elapsed().as_millis()
         );
@@ -129,8 +172,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let private_witness_half_shares = T::to_half_share_vec(&private_witness);
 
-        let timer_start = std::time::Instant::now();
-        let out = Self::create_proof_with_assignment(
+        Self::create_proof_with_assignment(
             net0,
             net1,
             state0,
@@ -141,12 +183,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             h,
             &public_inputs,
             &private_witness_half_shares,
-        );
-        println!(
-            "Proof with assignment took {} ms",
-            timer_start.elapsed().as_millis()
-        );
-        out
+        )
     }
 
     fn calculate_coeff<C>(
@@ -180,15 +217,23 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         input_assignment: &DeviceVec<B::IcicleScalarField>,
         aux_assignment: &DeviceVec<B::IcicleScalarField>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+        let total_timer = std::time::Instant::now();
         let ProvingKey {
             vk,
             beta_g1,
             delta_g1,
-            a_query,
-            b_g1_query,
-            b_g2_query,
+            a_query_first,
+            b_g1_query_first,
+            b_g2_query_first,
+            a_query_pub,
+            a_query_priv,
+            b_g1_query_pub,
+            b_g1_query_priv,
+            b_g2_query_pub,
+            b_g2_query_priv,
             l_query,
             h_query,
+            proof_streams,
             ..
         } = pkey;
 
@@ -204,52 +249,90 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let id = state0.id();
 
-        let (mut stream_g1, mut stream_g2) = (
-            IcicleStream::create().unwrap(),
-            IcicleStream::create().unwrap(),
-        );
+        let stream_g1 = &proof_streams.g1;
+        let stream_g2 = &proof_streams.g2;
 
-        let pub_len = input_assignment.len();
-
+        let msm_timer = std::time::Instant::now();
         // Compute A
         let (pub_acc_r_g1, priv_acc_r_g1) = (
-            msm_async(&a_query[1..pub_len], &input_assignment[1..], &stream_g1),
-            msm_async(&a_query[pub_len..], &aux_assignment, &stream_g1),
+            msm_async(
+                a_query_pub,
+                &input_assignment[1..],
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
+            msm_async(
+                a_query_priv,
+                aux_assignment,
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
         );
 
         // Compute B in G1
         let (pub_acc_s_g1, priv_acc_s_g1) = (
-            msm_async(&b_g1_query[1..pub_len], &input_assignment[1..], &stream_g1),
-            msm_async(&b_g1_query[pub_len..], &aux_assignment, &stream_g1),
+            msm_async(
+                b_g1_query_pub,
+                &input_assignment[1..],
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
+            msm_async(
+                b_g1_query_priv,
+                aux_assignment,
+                stream_g1,
+                PRECOMPUTE_FACTOR_G1,
+            ),
         );
 
         // Compute B in G2
         let (pub_acc_s_g2, priv_acc_s_g2) = (
-            msm_async(&b_g2_query[1..pub_len], &input_assignment[1..], &stream_g2),
-            msm_async(&b_g2_query[pub_len..], &aux_assignment, &stream_g2),
+            msm_async(
+                b_g2_query_pub,
+                &input_assignment[1..],
+                stream_g2,
+                PRECOMPUTE_FACTOR_G2,
+            ),
+            msm_async(
+                b_g2_query_priv,
+                aux_assignment,
+                stream_g2,
+                PRECOMPUTE_FACTOR_G2,
+            ),
         );
 
         // Compute msm(l_query, aux_assignment)
-        let l_acc = msm_async(l_query, aux_assignment, &stream_g1);
+        let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, &h, &stream_g1);
+        let h_acc = msm_async(h_query, &h, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
+        tracing::info!(
+            "MSM + stream sync took {} ms",
+            msm_timer.elapsed().as_millis()
+        );
 
-        stream_g1.destroy().unwrap();
-        stream_g2.destroy().unwrap();
+        let coeff_timer = std::time::Instant::now();
+        let pub_acc_r_g1 = get_first(&pub_acc_r_g1);
+        let priv_acc_r_g1 = get_first(&priv_acc_r_g1);
+        let pub_acc_s_g1 = get_first(&pub_acc_s_g1);
+        let priv_acc_s_g1 = get_first(&priv_acc_s_g1);
+        let l_acc = get_first(&l_acc);
+        let h_acc = get_first(&h_acc);
+        let pub_acc_s_g2 = get_first(&pub_acc_s_g2);
+        let priv_acc_s_g2 = get_first(&priv_acc_s_g2);
 
         let r_hs = T::to_half_share(&r);
         let r_g1 = delta_g1 * r_hs;
         let r_g1 = Self::calculate_coeff::<B::IcicleG1>(
             id,
             r_g1.into(),
-            get_first_affine(a_query).unwrap(),
+            *a_query_first,
             *alpha_g1,
-            get_first_projective(&pub_acc_r_g1).unwrap().into(),
-            get_first_projective(&priv_acc_r_g1).unwrap().into(),
+            pub_acc_r_g1.into(),
+            priv_acc_r_g1.into(),
         );
 
         // In original implementation this is skipped if r==0, however r is shared in our case
@@ -258,39 +341,43 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let s_g1 = Self::calculate_coeff::<B::IcicleG1>(
             id,
             s_g1.into(),
-            get_first_affine(&b_g1_query).unwrap(),
+            *b_g1_query_first,
             *beta_g1,
-            get_first_projective(&pub_acc_s_g1).unwrap().into(),
-            get_first_projective(&priv_acc_s_g1).unwrap().into(),
+            pub_acc_s_g1.into(),
+            priv_acc_s_g1.into(),
         );
 
         let s_g2 = delta_g2 * s_hs;
         let s_g2 = Self::calculate_coeff::<B::IcicleG2>(
             id,
             s_g2.into(),
-            get_first_affine(&b_g2_query).unwrap(),
+            *b_g2_query_first,
             *beta_g2,
-            get_first_projective(&pub_acc_s_g2).unwrap().into(),
-            get_first_projective(&priv_acc_s_g2).unwrap().into(),
+            pub_acc_s_g2.into(),
+            priv_acc_s_g2.into(),
         );
-
-        let l_acc = get_first_projective(&l_acc).unwrap();
-
-        let h_acc = get_first_projective(&h_acc).unwrap();
 
         // Compute r * s
         let rs = T::local_mul::<B>(&r, &s, state0);
         let r_s_delta_g1 = delta_g1 * rs;
+        tracing::info!(
+            "Coefficient assembly took {} ms",
+            coeff_timer.elapsed().as_millis()
+        );
 
+        let open_timer = std::time::Instant::now();
         let g_a = r_g1;
         let g1_b = s_g1;
 
         let (g_a_opened, r_g1_b) = rayon::join(
             || T::open_half_point_g1::<_, B>(g_a, net0, state0).expect("Failed to open g_a"),
-            || T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1).expect("Failed to scalar mul g1_b with r")
+            || {
+                T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1)
+                    .expect("Failed to scalar mul g1_b with r")
+            },
         );
 
-        let s_g_a = g_a_opened.to_projective() * s_hs;
+        let s_g_a: Projective<<B as ArkIcicleBridge>::IcicleG1> = g_a_opened.to_projective() * s_hs;
 
         let mut g_c = s_g_a;
         g_c = g_c + r_g1_b.to_projective();
@@ -302,6 +389,14 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let (g_c_opened, g2_b_opened) = rayon::join(
             || T::open_half_point_g1::<_, B>(g_c.into(), net0, state0),
             || T::open_half_point_g2::<_, B>(g2_b, net1, state1),
+        );
+        tracing::info!(
+            "Point openings took {} ms",
+            open_timer.elapsed().as_millis()
+        );
+        tracing::info!(
+            "Proof with assignment took {} ms",
+            total_timer.elapsed().as_millis()
         );
 
         Ok(Proof {
@@ -369,6 +464,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
     /// DOES NOT PERFORM ANY MPC. For a plain prover checkout the [Groth16 implementation of arkworks](https://docs.rs/ark-groth16/latest/ark_groth16/).
     pub fn plain_prove<R: R1CSToQAP>(
         pkey: &ark_groth16::ProvingKey<P>,
+        prepared_bn_254_key: Option<Arc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, P::ScalarField>,
     ) -> Result<ark_groth16::Proof<P>> {
@@ -395,13 +491,20 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                 public_inputs
             );
 
-            let (key, mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
+            let prepared_key = prepared_bn_254_key.unwrap_or_else(|| {
+                Arc::new(prepare_bn254_key::<R>(
+                    key,
+                    matrices.num_constraints,
+                    matrices.num_instance_variables,
+                ))
+            });
+
+            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
                 CoGroth16Icicle::<Bn254Bridge, PlainGroth16Driver>::setup::<
                     co_groth16::mpc::PlainGroth16Driver,
                     R,
                 >(
-                    0, // id irrelevant in the
-                    key,
+                    0, // id irrelevant in the plain case
                     matrices,
                     private_witness,
                     public_inputs,
@@ -417,7 +520,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
-                    &key,
+                    &prepared_key,
                     private_witness,
                     &public_inputs,
                 )?;
@@ -443,18 +546,23 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                 public_inputs
             );
 
-            let (key, mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
+            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
                 CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::setup::<
                     co_groth16::mpc::PlainGroth16Driver,
                     R,
                 >(
                     0, // id irrelevant in the
-                    key,
                     matrices,
                     private_witness,
                     public_inputs,
                     domain_size,
                 )?;
+
+            let prepared_key = prepare_bls12_377_key::<R>(
+                key,
+                matrices.num_constraints,
+                matrices.num_instance_variables,
+            );
 
             let icicle_proof =
                 CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
@@ -465,7 +573,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
-                    &key,
+                    &prepared_key,
                     private_witness,
                     &public_inputs,
                 )?;
@@ -490,6 +598,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
         net0: &N,
         net1: &N,
         pkey: &ark_groth16::ProvingKey<P>,
+        prepared_bn254_key: Option<Arc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
     ) -> Result<ark_groth16::Proof<P>> {
@@ -520,19 +629,25 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                 public_inputs
             );
 
-            let (key, mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
+            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
                 CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::setup::<
                     co_groth16::mpc::Rep3Groth16Driver,
                     R,
                 >(
                     state0.id(),
-                    key,
                     matrices,
                     private_witness,
                     public_inputs,
                     domain_size,
                 )?;
 
+            let prepared_key = prepared_bn254_key.unwrap_or_else(|| {
+                Arc::new(prepare_bn254_key::<R>(
+                    key,
+                    matrices.num_constraints,
+                    matrices.num_instance_variables,
+                ))
+            });
             let icicle_proof =
                 CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::prove_inner::<N, R>(
                     &net0,
@@ -542,7 +657,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
-                    &key,
+                    &prepared_key,
                     private_witness,
                     &public_inputs,
                 )?;
