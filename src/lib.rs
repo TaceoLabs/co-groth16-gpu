@@ -40,6 +40,7 @@ mod tests {
     use mpc_net::{Network, local::LocalNetwork};
     use rand::thread_rng;
 
+    use std::rc::Rc;
     use std::{
         fs::File,
         io::BufReader,
@@ -193,7 +194,7 @@ mod tests {
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
                 gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
                 pkey = &pkey,
-                prepared_key = Some(Arc::new(prepared_key)),
+                prepared_key = Some(Rc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
                 silent = false
@@ -231,7 +232,7 @@ mod tests {
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
                 gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
                 pkey = &pkey,
-                prepared_key = Some(Arc::new(prepared_key)),
+                prepared_key = Some(Rc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
                 silent = false
@@ -274,7 +275,7 @@ mod tests {
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
                 gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
                 pkey = &pkey,
-                prepared_key = Some(Arc::new(prepared_key)),
+                prepared_key = Some(Rc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
                 silent = false
@@ -349,7 +350,7 @@ mod tests {
                             cpu_prove = cpu_prove,
                             gpu_prove = gpu_prove,
                             pkey = &zkey.1,
-                            prepared_key = Some(Arc::new(prepared_key)),
+                            prepared_key = Some(Rc::new(prepared_key)),
                             matrices = &zkey.0,
                             witness = x,
                             silent = false // only print for the first party to avoid cluttering the output

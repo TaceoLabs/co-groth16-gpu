@@ -9,6 +9,7 @@ target/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+Cargo.lock
 .vscode
 co-noir/co-acvm/src/bin/
 co-circom/co-plonk/src/bin/

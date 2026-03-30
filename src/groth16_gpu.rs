@@ -13,7 +13,7 @@ use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_net::Network;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::{marker::PhantomData, mem::transmute};
 
 use icicle_core::msm::MSM;
@@ -464,7 +464,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
     /// DOES NOT PERFORM ANY MPC. For a plain prover checkout the [Groth16 implementation of arkworks](https://docs.rs/ark-groth16/latest/ark_groth16/).
     pub fn plain_prove<R: R1CSToQAP>(
         pkey: &ark_groth16::ProvingKey<P>,
-        prepared_bn_254_key: Option<Arc<Bn254PreparedKey>>,
+        prepared_bn_254_key: Option<Rc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, P::ScalarField>,
     ) -> Result<ark_groth16::Proof<P>> {
@@ -492,7 +492,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
             );
 
             let prepared_key = prepared_bn_254_key.unwrap_or_else(|| {
-                Arc::new(prepare_bn254_key::<R>(
+                Rc::new(prepare_bn254_key::<R>(
                     key,
                     matrices.num_constraints,
                     matrices.num_instance_variables,
@@ -598,7 +598,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
         net0: &N,
         net1: &N,
         pkey: &ark_groth16::ProvingKey<P>,
-        prepared_bn254_key: Option<Arc<Bn254PreparedKey>>,
+        prepared_bn254_key: Option<Rc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
     ) -> Result<ark_groth16::Proof<P>> {
@@ -642,7 +642,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                 )?;
 
             let prepared_key = prepared_bn254_key.unwrap_or_else(|| {
-                Arc::new(prepare_bn254_key::<R>(
+                Rc::new(prepare_bn254_key::<R>(
                     key,
                     matrices.num_constraints,
                     matrices.num_instance_variables,
