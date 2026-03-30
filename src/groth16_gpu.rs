@@ -8,7 +8,7 @@ use ark_relations::r1cs::ConstraintMatrices;
 use co_circom_types::SharedWitness;
 use eyre::Result;
 use icicle_core::curve::{Affine, Curve, Projective};
-use icicle_runtime::memory::DeviceVec;
+use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
@@ -251,6 +251,22 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let stream_g1 = &proof_streams.g1;
         let stream_g2 = &proof_streams.g2;
+
+        tracing::info!(
+            "msm lens: pub={} aux={} | a_pub={} a_priv={} | b1_pub={} b1_priv={} | b2_pub={} b2_priv={} | l_query={} h_query={} h={}",
+            input_assignment.len().saturating_sub(1),
+            aux_assignment.len(),
+            a_query_pub.len(),
+            a_query_priv.len(),
+            b_g1_query_pub.len(),
+            b_g1_query_priv.len(),
+            b_g2_query_pub.len(),
+            b_g2_query_priv.len(),
+            l_query.len(),
+            h_query.len(),
+            h.len(),
+        );
+
 
         let msm_timer = std::time::Instant::now();
         // Compute A

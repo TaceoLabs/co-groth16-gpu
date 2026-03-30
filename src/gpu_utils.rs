@@ -16,8 +16,8 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
-pub const PRECOMPUTE_FACTOR_G1: i32 = 8;
-pub const PRECOMPUTE_FACTOR_G2: i32 = 8;
+pub const PRECOMPUTE_FACTOR_G1: i32 = 1;
+pub const PRECOMPUTE_FACTOR_G2: i32 = 1;
 pub const C: i32 = 0; // Lets icicle auto-pick
 pub const LARGE_BUCKET_FACTOR: i32 = 5;
 
@@ -280,6 +280,16 @@ impl<
         let b_g2_query_pub_host = b_g2_query[1..num_instance_variables].to_vec();
         let b_g2_query_priv_host = b_g2_query[num_instance_variables..].to_vec();
 
+        tracing::info!(
+            "pk lens: num_instance={} | a_total={} b1_total={} b2_total={} l={} h={} | a_pub={} a_priv={} b1_pub={} b1_priv={} b2_pub={} b2_priv={}",
+            num_instance_variables,
+            a_query.len(), b_g1_query.len(), b_g2_query.len(),
+            l_query_host.len(), h_query_host.len(),
+            a_query_pub_host.len(), a_query_priv_host.len(),
+            b_g1_query_pub_host.len(), b_g1_query_priv_host.len(),
+            b_g2_query_pub_host.len(), b_g2_query_priv_host.len(),
+        );
+
         let mut streams = (0..8)
             .map(|_| IcicleStream::create().unwrap())
             .collect::<Vec<_>>();
@@ -404,12 +414,40 @@ pub(crate) fn msm_async<
     stream: &IcicleStream,
     precompute_factor: i32,
 ) -> DeviceVec<Projective<C>> {
+    // Arkworks `msm_unchecked` truncates to the shortest input length.
+    // Mirror that behavior here because ICICLE expects exact divisibility.
+    let precompute_factor = precompute_factor.max(1) as usize;
+    assert!(
+        points.len().is_multiple_of(precompute_factor),
+        "Precompute factor {} does not divide number of points {}",
+        precompute_factor,
+        points.len()
+    );
+    let base_len = points.len() / precompute_factor;
+    let msm_len = base_len.min(scalars.len());
+
+    if msm_len == 0 {
+        let zero = [Projective::<C>::zero()];
+        return from_host_slice_async(&zero, stream);
+    }
+
+    let points = if msm_len == base_len {
+        points
+    } else {
+        &points[..(msm_len * precompute_factor)]
+    };
+    let scalars = if msm_len == scalars.len() {
+        scalars
+    } else {
+        &scalars[..msm_len]
+    };
+
     let mut results: DeviceVec<Projective<C>> =
         DeviceVec::device_malloc_async(1, stream).expect("Failed to allocate device vector");
     let mut cfg = MSMConfig::default();
     cfg.stream_handle = **stream;
     cfg.is_async = true;
-    cfg.precompute_factor = precompute_factor.max(1);
+    cfg.precompute_factor = precompute_factor as i32;
     cfg.c = C;
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
