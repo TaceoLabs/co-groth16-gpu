@@ -279,15 +279,20 @@ impl<
         let b_g1_query_priv_host = b_g1_query[num_instance_variables..].to_vec();
         let b_g2_query_pub_host = b_g2_query[1..num_instance_variables].to_vec();
         let b_g2_query_priv_host = b_g2_query[num_instance_variables..].to_vec();
-
-        tracing::info!(
+        println!(
             "pk lens: num_instance={} | a_total={} b1_total={} b2_total={} l={} h={} | a_pub={} a_priv={} b1_pub={} b1_priv={} b2_pub={} b2_priv={}",
             num_instance_variables,
-            a_query.len(), b_g1_query.len(), b_g2_query.len(),
-            l_query_host.len(), h_query_host.len(),
-            a_query_pub_host.len(), a_query_priv_host.len(),
-            b_g1_query_pub_host.len(), b_g1_query_priv_host.len(),
-            b_g2_query_pub_host.len(), b_g2_query_priv_host.len(),
+            a_query.len(),
+            b_g1_query.len(),
+            b_g2_query.len(),
+            l_query_host.len(),
+            h_query_host.len(),
+            a_query_pub_host.len(),
+            a_query_priv_host.len(),
+            b_g1_query_pub_host.len(),
+            b_g1_query_priv_host.len(),
+            b_g2_query_pub_host.len(),
+            b_g2_query_priv_host.len(),
         );
 
         let mut streams = (0..8)
@@ -367,7 +372,7 @@ pub(crate) fn initialize_domain<F: FieldImpl<Config: NTTDomain<F>> + 'static>(ma
     match res {
         Ok(_) => (),
         Err(e) => {
-            tracing::info!("Warning: Failed to release existing NTT domain: {e}");
+            eprintln!("Warning: Failed to release existing NTT domain: {e}");
         }
     }
 
@@ -425,6 +430,12 @@ pub(crate) fn msm_async<
     );
     let base_len = points.len() / precompute_factor;
     let msm_len = base_len.min(scalars.len());
+    if base_len != scalars.len() {
+        eprintln!(
+            "msm truncation: bases={} scalars={} precompute_factor={} using={}",
+            base_len, scalars.len(), precompute_factor, msm_len
+        );
+    }
 
     if msm_len == 0 {
         let zero = [Projective::<C>::zero()];

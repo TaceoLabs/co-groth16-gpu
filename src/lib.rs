@@ -94,36 +94,36 @@ mod tests {
 
             // ---- CPU prove ----
             if !$silent {
-                tracing::info!("------------------- Proving (CPU) --------------------");
+                println!("------------------- Proving (CPU) --------------------");
             }
             let t0 = Instant::now();
             let _ = ($cpu_prove)($pkey, $matrices, witness.clone())
                 .expect("CPU proof generation works");
             if !$silent {
-                tracing::info!("Time taken for CPU proving: {:?}", t0.elapsed());
+                println!("Time taken for CPU proving: {:?}", t0.elapsed());
 
                 // ---- GPU warm-up ----
-                tracing::info!("-------------- Proving (GPU before warm-up) --------------");
+                println!("-------------- Proving (GPU before warm-up) --------------");
             }
             let t1 = Instant::now();
             let _ = ($gpu_prove)($pkey, prepared_key.clone(), $matrices, witness.clone())
                 .expect("GPU proof generation works (before warm-up)");
 
             if !$silent {
-                tracing::info!(
+                println!(
                     "Time taken for GPU proving (before warm-up): {:?}\n",
                     t1.elapsed()
                 );
 
                 // ---- GPU final prove ----
-                tracing::info!("-------------- Proving (GPU after warm-up) --------------");
+                println!("-------------- Proving (GPU after warm-up) --------------");
             }
             let t2 = Instant::now();
             let _ = ($gpu_prove)($pkey, prepared_key, $matrices, witness)
                 .expect("GPU proof generation works (after warm-up)");
 
             if !$silent {
-                tracing::info!(
+                println!(
                     "Time taken for GPU proving (after warm-up): {:?}\n",
                     t2.elapsed()
                 );

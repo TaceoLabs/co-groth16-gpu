@@ -124,7 +124,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
         let public_elapsed = public_timer.elapsed();
 
-        tracing::info!(
+        println!(
             "Setup timings: evaluate_constraints={} ms, witness_to_device={} ms, public_to_device={} ms, total={} ms",
             eval_elapsed.as_millis(),
             witness_elapsed.as_millis(),
@@ -160,7 +160,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             pkey.num_constraints,
             pkey.domain_size,
         )?;
-        tracing::info!(
+        println!(
             "Witness map computation took {} ms",
             timer_start.elapsed().as_millis()
         );
@@ -252,7 +252,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let stream_g1 = &proof_streams.g1;
         let stream_g2 = &proof_streams.g2;
 
-        tracing::info!(
+        println!(
             "msm lens: pub={} aux={} | a_pub={} a_priv={} | b1_pub={} b1_priv={} | b2_pub={} b2_priv={} | l_query={} h_query={} h={}",
             input_assignment.len().saturating_sub(1),
             aux_assignment.len(),
@@ -266,7 +266,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             h_query.len(),
             h.len(),
         );
-
 
         let msm_timer = std::time::Instant::now();
         // Compute A
@@ -325,7 +324,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
-        tracing::info!(
+        println!(
             "MSM + stream sync took {} ms",
             msm_timer.elapsed().as_millis()
         );
@@ -376,7 +375,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         // Compute r * s
         let rs = T::local_mul::<B>(&r, &s, state0);
         let r_s_delta_g1 = delta_g1 * rs;
-        tracing::info!(
+        println!(
             "Coefficient assembly took {} ms",
             coeff_timer.elapsed().as_millis()
         );
@@ -406,11 +405,11 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             || T::open_half_point_g1::<_, B>(g_c.into(), net0, state0),
             || T::open_half_point_g2::<_, B>(g2_b, net1, state1),
         );
-        tracing::info!(
+        println!(
             "Point openings took {} ms",
             open_timer.elapsed().as_millis()
         );
-        tracing::info!(
+        println!(
             "Proof with assignment took {} ms",
             total_timer.elapsed().as_millis()
         );
