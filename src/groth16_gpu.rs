@@ -13,13 +13,13 @@ use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_net::Network;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::{marker::PhantomData, mem::transmute};
 
 use icicle_core::msm::MSM;
 
 use crate::bridges::{ArkIcicleBridge, Bls12_377Bridge, Bn254Bridge, ark_to_icicle_scalars};
-use crate::gpu_utils::{Proof, ProvingKey, VerifyingKey};
+use crate::gpu_utils::{Proof, ProofStreams, ProvingKey, VerifyingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
@@ -233,7 +233,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             b_g2_query_priv,
             l_query,
             h_query,
-            proof_streams,
             ..
         } = pkey;
 
@@ -249,6 +248,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let id = state0.id();
 
+        let proof_streams = ProofStreams::new();
         let stream_g1 = &proof_streams.g1;
         let stream_g2 = &proof_streams.g2;
 
@@ -464,7 +464,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
     /// DOES NOT PERFORM ANY MPC. For a plain prover checkout the [Groth16 implementation of arkworks](https://docs.rs/ark-groth16/latest/ark_groth16/).
     pub fn plain_prove<R: R1CSToQAP>(
         pkey: &ark_groth16::ProvingKey<P>,
-        prepared_bn_254_key: Option<Rc<Bn254PreparedKey>>,
+        prepared_bn_254_key: Option<Arc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, P::ScalarField>,
     ) -> Result<ark_groth16::Proof<P>> {
@@ -492,7 +492,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
             );
 
             let prepared_key = prepared_bn_254_key.unwrap_or_else(|| {
-                Rc::new(prepare_bn254_key::<R>(
+                Arc::new(prepare_bn254_key::<R>(
                     key,
                     matrices.num_constraints,
                     matrices.num_instance_variables,
@@ -531,7 +531,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                 transmute::<&ark_groth16::Proof<ark_bn254::Bn254>, &ark_groth16::Proof<P>>(&proof)
             };
 
-            return Ok(proof.clone());
+            Ok(proof.clone())
         } else if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bls12_377::Bls12_377>()
         {
             let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
@@ -586,7 +586,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
                 )
             };
 
-            return Ok(proof.clone());
+            Ok(proof.clone())
         } else {
             panic!("Unsupported pairing")
         }
@@ -598,7 +598,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
         net0: &N,
         net1: &N,
         pkey: &ark_groth16::ProvingKey<P>,
-        prepared_bn254_key: Option<Rc<Bn254PreparedKey>>,
+        prepared_bn254_key: Option<Arc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
     ) -> Result<ark_groth16::Proof<P>> {
@@ -642,7 +642,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                 )?;
 
             let prepared_key = prepared_bn254_key.unwrap_or_else(|| {
-                Rc::new(prepare_bn254_key::<R>(
+                Arc::new(prepare_bn254_key::<R>(
                     key,
                     matrices.num_constraints,
                     matrices.num_instance_variables,

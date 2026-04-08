@@ -187,7 +187,6 @@ pub struct ProvingKey<
     pub(crate) domain_size: usize,
     pub(crate) precomputed_roots: DeviceVec<F>,
     pub(crate) num_constraints: usize,
-    pub(crate) proof_streams: ProofStreams,
 }
 
 pub struct ProofStreams {
@@ -196,7 +195,7 @@ pub struct ProofStreams {
 }
 
 impl ProofStreams {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             g1: IcicleStream::create().unwrap(),
             g2: IcicleStream::create().unwrap(),
@@ -347,7 +346,6 @@ impl<
             domain_size,
             precomputed_roots,
             num_constraints,
-            proof_streams: ProofStreams::new(),
         }
     }
 }

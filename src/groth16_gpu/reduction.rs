@@ -184,9 +184,9 @@ impl R1CSToQAP for LibSnarkReduction {
         let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
         T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
 
-        // TODO CESAR
+        // TODO
         let vanishing_polynomial_over_coset =
-            (B::ArkScalarField::GENERATOR.pow(&[domain_size as u64]) - B::ArkScalarField::one())
+            (B::ArkScalarField::GENERATOR.pow([domain_size as u64]) - B::ArkScalarField::one())
                 .inverse()
                 .unwrap();
 
