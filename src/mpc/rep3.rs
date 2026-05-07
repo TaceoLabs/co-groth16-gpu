@@ -225,6 +225,9 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         add_scalars(&tmp0, &tmp1, result.as_mut_slice(), &cfg).unwrap();
         add_scalars(&tmp2, &result, tmp0.as_mut_slice(), &cfg).unwrap();
         add_scalars(&tmp0, &masking_fes, result.as_mut_slice(), &cfg).unwrap();
+        stream
+            .synchronize()
+            .expect("Failed to synchronize local_mul_vec stream");
 
         result
     }

@@ -148,6 +148,9 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         cfg.is_async = true;
 
         mul_scalars(a, b, result.as_mut_slice(), &cfg).unwrap();
+        stream
+            .synchronize()
+            .expect("Failed to synchronize local_mul_vec stream");
         result
     }
 
