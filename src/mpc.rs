@@ -71,6 +71,12 @@ pub trait CircomGroth16Prover<
         cfg.is_async = true;
 
         mul_scalars(coeffs, roots, result.as_mut_slice(), &cfg).unwrap();
+        
+        // TODO CESAR: Investigate if we can avoid this synchronization
+        stream
+            .synchronize()
+            .expect("Failed to synchronize distribute_powers stream");
+        
         *coeffs = result;
     }
 

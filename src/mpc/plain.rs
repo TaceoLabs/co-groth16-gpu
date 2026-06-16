@@ -67,6 +67,11 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         cfg.stream_handle = **stream;
         cfg.is_async = true;
         mul_scalars(coeffs, roots, result.as_mut_slice(), &cfg).unwrap();
+        
+        // TODO CESAR: Investigate if we can avoid this synchronization
+        stream
+            .synchronize()
+            .expect("Failed to synchronize distribute_powers stream");
         *coeffs = result;
     }
 
