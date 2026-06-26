@@ -12,7 +12,7 @@ use icicle_core::{
     vec_ops::{VecOps, VecOpsConfig, mul_scalars},
 };
 use icicle_runtime::{
-    memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice},
+    memory::{DeviceSlice, DeviceVec},
     stream::IcicleStream,
 };
 use mpc_core::MpcState;
@@ -58,20 +58,18 @@ pub trait CircomGroth16Prover<
     );
 
     /// Computes the \[coeffs_i\] *= c * g^i for the coefficients in 0 <= i < coeff.len()
-    // TODO CESAR: Check if we can avoid alloc
     fn distribute_powers_and_mul_by_const_hs(
         coeffs: &mut DeviceVec<F>,
         roots: &DeviceSlice<F>,
         stream: &IcicleStream,
     ) {
-        let mut result = DeviceVec::device_malloc_async(coeffs.len(), stream)
-            .expect("Failed to allocate device vector");
         let mut cfg = VecOpsConfig::default();
         cfg.stream_handle = **stream;
         cfg.is_async = true;
 
-        mul_scalars(coeffs, roots, result.as_mut_slice(), &cfg).unwrap();
-        *coeffs = result;
+        // SAFETY: elementwise mul so in place aliasing is sound
+        let coeffs_in: &DeviceSlice<F> = unsafe { &*(&**coeffs as *const DeviceSlice<F>) };
+        mul_scalars(coeffs_in, roots, coeffs.as_mut_slice(), &cfg).unwrap();
     }
 
     /// Converts a shared value to a half shared value. Local interaction only.

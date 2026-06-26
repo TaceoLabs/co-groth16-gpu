@@ -91,22 +91,21 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         Self::DeviceShares { a, b }
     }
 
-    // TODO CESAR: Check if there's a better way
     fn distribute_powers_and_mul_by_const(
         coeffs: &mut Self::DeviceShares,
         roots: &DeviceSlice<F>,
         stream: &IcicleStream,
     ) {
-        let mut a = DeviceVec::device_malloc_async(coeffs.a.len(), stream)
-            .expect("Failed to allocate device vector");
-        let mut b = DeviceVec::device_malloc_async(coeffs.b.len(), stream)
-            .expect("Failed to allocate device vector");
         let mut cfg = VecOpsConfig::default();
         cfg.stream_handle = **stream;
         cfg.is_async = true;
-        mul_scalars(&coeffs.a, roots, a.as_mut_slice(), &cfg).unwrap();
-        mul_scalars(&coeffs.b, roots, b.as_mut_slice(), &cfg).unwrap();
-        *coeffs = Self::DeviceShares { a, b };
+
+        // SAFETY: elementwise mul so in place aliasing is sound
+        let a_in: &DeviceSlice<F> = unsafe { &*(&*coeffs.a as *const DeviceSlice<F>) };
+        mul_scalars(a_in, roots, coeffs.a.as_mut_slice(), &cfg).unwrap();
+        // SAFETY: as above
+        let b_in: &DeviceSlice<F> = unsafe { &*(&*coeffs.b as *const DeviceSlice<F>) };
+        mul_scalars(b_in, roots, coeffs.b.as_mut_slice(), &cfg).unwrap();
     }
 
     fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
