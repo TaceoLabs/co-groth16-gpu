@@ -55,19 +55,18 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         result
     }
 
-    // TODO CESAR: Check if we can avoid alloc
     fn distribute_powers_and_mul_by_const(
         coeffs: &mut Self::DeviceShares,
         roots: &DeviceSlice<F>,
         stream: &IcicleStream,
     ) {
-        let mut result = DeviceVec::device_malloc_async(coeffs.len(), stream)
-            .expect("Failed to allocate device vector");
         let mut cfg = VecOpsConfig::default();
         cfg.stream_handle = **stream;
         cfg.is_async = true;
-        mul_scalars(coeffs, roots, result.as_mut_slice(), &cfg).unwrap();
-        *coeffs = result;
+
+        // SAFETY: elementwise mul so in place aliasing is sound
+        let coeffs_in: &DeviceSlice<F> = unsafe { &*(&**coeffs as *const DeviceSlice<F>) };
+        mul_scalars(coeffs_in, roots, coeffs.as_mut_slice(), &cfg).unwrap();
     }
 
     fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
