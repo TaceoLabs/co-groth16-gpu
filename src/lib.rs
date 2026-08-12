@@ -28,7 +28,7 @@ mod tests {
     use ark_bn254::Bn254;
 
     use ark_ff::UniformRand;
-    use ark_relations::r1cs::Matrix;
+    use ark_relations::utils::matrix::Matrix;
     use ark_serialize::CanonicalDeserialize;
     use circom_types::{CheckElement, Witness, groth16::Zkey};
     use co_circom_types::SharedWitness;

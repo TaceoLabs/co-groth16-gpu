@@ -4,8 +4,8 @@ use crate::gpu_utils::{
 };
 use ark_bn254::Bn254;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
-use ark_relations::r1cs::ConstraintMatrices;
 use co_circom_types::SharedWitness;
+use co_groth16::ConstraintMatrices;
 use eyre::Result;
 use icicle_core::curve::{Affine, Curve, Projective};
 use icicle_runtime::memory::DeviceVec;
