@@ -1,6 +1,6 @@
 use ark_ff::{FftField, LegendreSymbol, PrimeField};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
-use ark_relations::r1cs::Matrix;
+use ark_relations::utils::matrix::Matrix;
 use mpc_core::MpcState;
 use num_traits::ToPrimitive;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
