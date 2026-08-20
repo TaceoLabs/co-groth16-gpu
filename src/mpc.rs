@@ -107,7 +107,7 @@ pub trait CircomGroth16Prover<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        shares: &Vec<T::ArithmeticShare>,
+        shares: &[T::ArithmeticShare],
     ) -> Self::DeviceShares;
 
     /// Converts a vector of arithmetic shares to device shares.
@@ -115,7 +115,7 @@ pub trait CircomGroth16Prover<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        shares: &Vec<T::ArithmeticHalfShare>,
+        shares: &[T::ArithmeticHalfShare],
     ) -> DeviceVec<F>;
 
     /// Evaluates the constraints for a given party ID and transforms the results into device shares.
@@ -139,7 +139,7 @@ pub trait CircomGroth16Prover<
         };
 
         let eval_a = evaluate_constraint::<B::ArkPairing, T>(
-            id.clone(),
+            *id,
             domain_size,
             &matrices.a,
             public_inputs,
@@ -148,7 +148,7 @@ pub trait CircomGroth16Prover<
         let eval_a = Self::shares_to_device::<B, T>(&eval_a);
 
         let eval_b = evaluate_constraint::<B::ArkPairing, T>(
-            id.clone(),
+            *id,
             domain_size,
             &matrices.b,
             public_inputs,
@@ -158,7 +158,7 @@ pub trait CircomGroth16Prover<
 
         let eval_c = if eval_c {
             let eval_c = evaluate_constraint_half_share::<B::ArkPairing, T>(
-                id.clone(),
+                *id,
                 domain_size,
                 &matrices.c,
                 public_inputs,

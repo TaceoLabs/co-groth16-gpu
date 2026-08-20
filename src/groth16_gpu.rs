@@ -90,11 +90,12 @@ pub fn prepare_bls12_377_key<R: R1CSToQAP>(
 }
 
 impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16Icicle<B, T> {
+    #[expect(clippy::type_complexity)]
     fn setup<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static, R: R1CSToQAP>(
         id: <T::State as MpcState>::PartyID,
         matrices: &ConstraintMatrices<B::ArkScalarField>,
-        private_witness: &Vec<U::ArithmeticShare>,
-        public_inputs: &Vec<B::ArkScalarField>,
+        private_witness: &[U::ArithmeticShare],
+        public_inputs: &[B::ArkScalarField],
         domain_size: usize,
     ) -> eyre::Result<(
         T::DeviceShares,
@@ -137,6 +138,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
     /// Execute the Groth16 prover using the internal MPC driver.
     /// This version takes the Circom-generated constraint matrices as input and does not re-calculate them.
+    #[expect(clippy::too_many_arguments)]
     fn prove_inner<N: Network, R: R1CSToQAP>(
         net0: &N,
         net1: &N,
@@ -181,7 +183,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             r,
             s,
             h,
-            &public_inputs,
+            public_inputs,
             &private_witness_half_shares,
         )
     }
@@ -438,20 +440,25 @@ macro_rules! transmute_groth16_artifacts {
             size_of::<Vec<$DstField>>(),
         );
 
+        let pkey = $pkey;
+        let matrices = $matrices;
+        let private_witness = $private_witness;
+        let public_inputs = $public_inputs;
+
         unsafe {
             (
                 transmute::<&ark_groth16::ProvingKey<$SrcPair>, &ark_groth16::ProvingKey<$DstPair>>(
-                    $pkey,
+                    pkey,
                 ),
-                transmute::<&Vec<$SrcArithmeticShare>, &Vec<$DstArithmeticShare>>($private_witness),
+                transmute::<&Vec<$SrcArithmeticShare>, &Vec<$DstArithmeticShare>>(private_witness),
                 transmute::<
                     &ConstraintMatrices<<$SrcPair as ark_ec::pairing::Pairing>::ScalarField>,
                     &ConstraintMatrices<$DstField>,
-                >($matrices),
+                >(matrices),
                 transmute::<
                     &Vec<<$SrcPair as ark_ec::pairing::Pairing>::ScalarField>,
                     &Vec<$DstField>,
-                >($public_inputs),
+                >(public_inputs),
             )
         }
     }};
@@ -650,8 +657,8 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
             });
             let icicle_proof =
                 CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::prove_inner::<N, R>(
-                    &net0,
-                    &net1,
+                    net0,
+                    net1,
                     &mut state0,
                     &mut state1,
                     &mut eval_a,
@@ -668,9 +675,9 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                 transmute::<&ark_groth16::Proof<ark_bn254::Bn254>, &ark_groth16::Proof<P>>(&proof)
             };
 
-            return Ok(proof.clone());
+            Ok(proof.clone())
         } else {
             panic!("Unsupported pairing")
-        };
+        }
     }
 }

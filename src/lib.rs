@@ -131,7 +131,7 @@ mod tests {
         }};
     }
 
-    fn dummy_prove<P: ark_ec::pairing::Pairing, S>(
+    fn dummy_prove<P: ark_ec::pairing::Pairing>(
         net0: &LocalNetwork,
         net1: &LocalNetwork,
         _pkey: &ProvingKey<P>,
@@ -356,13 +356,11 @@ mod tests {
                         );
                     } else {
                         let cpu_prove = |pkey, matrices, witness| {
-                            dummy_prove::<Bn254, Rep3PrimeFieldShare<ark_bn254::Fr>>(
-                                &net0, &net1, pkey, None, matrices, witness,
-                            )
+                            dummy_prove::<Bn254>(&net0, &net1, pkey, None, matrices, witness)
                         };
 
                         let gpu_prove = |pkey, prepared_key, matrices, witness| {
-                            dummy_prove::<Bn254, Rep3PrimeFieldShare<ark_bn254::Fr>>(
+                            dummy_prove::<Bn254>(
                                 &net0,
                                 &net1,
                                 pkey,
@@ -386,7 +384,7 @@ mod tests {
             }
 
             threads.into_iter().for_each(|t| {
-                let _ = t.join().unwrap();
+                t.join().unwrap();
             });
         }
     }
@@ -454,9 +452,9 @@ mod tests {
                 }));
             }
 
-            let _ = threads.pop().unwrap().join().unwrap();
-            let _ = threads.pop().unwrap().join().unwrap();
-            let _ = threads.pop().unwrap().join().unwrap();
+            threads.pop().unwrap().join().unwrap();
+            threads.pop().unwrap().join().unwrap();
+            threads.pop().unwrap().join().unwrap();
         }
     }
 
