@@ -53,7 +53,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     type State = Rep3State;
 
     fn to_half_share(a: &Self::ArithmeticShare) -> F {
-        a.a.clone()
+        a.a
     }
 
     // TODO CESAR: Avoid copy
@@ -142,7 +142,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        shares: &Vec<T::ArithmeticShare>,
+        shares: &[T::ArithmeticShare],
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -152,9 +152,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // SAFETY: At this point we know the shares are safe to transmute
         let shares = unsafe {
-            transmute::<&Vec<T::ArithmeticShare>, &Vec<Rep3PrimeFieldShare<B::ArkScalarField>>>(
-                shares,
-            )
+            transmute::<&[T::ArithmeticShare], &[Rep3PrimeFieldShare<B::ArkScalarField>]>(shares)
         };
 
         let (shares_a, shares_b): (Vec<B::ArkScalarField>, Vec<B::ArkScalarField>) =
@@ -173,7 +171,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        shares: &Vec<T::ArithmeticHalfShare>,
+        shares: &[T::ArithmeticHalfShare],
     ) -> DeviceVec<F> {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -183,9 +181,9 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
-            unsafe { transmute::<&Vec<T::ArithmeticHalfShare>, &Vec<B::ArkScalarField>>(shares) };
+            unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
 
-        let shares = from_host_slice(&shares);
+        let shares = from_host_slice(shares);
 
         ark_to_icicle_scalars(shares).unwrap()
     }
@@ -310,7 +308,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         let shares = host_a
             .into_iter()
-            .zip(host_b.into_iter())
+            .zip(host_b)
             .map(|(a, b)| Rep3PrimeFieldShare { a, b })
             .collect::<Vec<_>>();
         let opened = arithmetic::open_vec(&shares, net).unwrap();
@@ -332,7 +330,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         Ok(host_a
             .into_iter()
-            .zip(b.into_iter().zip(c.into_iter()))
+            .zip(b.into_iter().zip(c))
             .map(|(a, (b, c))| a + b + c)
             .collect::<Vec<_>>())
     }

@@ -51,6 +51,7 @@ thread_local! {
 pub trait R1CSToQAP {
     /// Computes a QAP witness corresponding to the R1CS witness defined by `private_witness`, using the provided `ConstraintMatrices`.
     /// The provided `driver` is used to perform the necessary operations on the secret-shared witness.
+    #[expect(clippy::too_many_arguments)]
     fn witness_map_from_r1cs_eval<
         B: ArkIcicleBridge,
         T: CircomGroth16Prover<B::IcicleScalarField>,

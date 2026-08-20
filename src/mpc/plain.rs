@@ -98,7 +98,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        shares: &Vec<T::ArithmeticShare>,
+        shares: &[T::ArithmeticShare],
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
@@ -107,8 +107,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         }
 
         // SAFETY: At this point we know the shares are safe to transmute
-        let shares =
-            unsafe { transmute::<&Vec<T::ArithmeticShare>, &Vec<B::ArkScalarField>>(shares) };
+        let shares = unsafe { transmute::<&[T::ArithmeticShare], &[B::ArkScalarField]>(shares) };
 
         let shares_icicle = from_host_slice(shares);
         ark_to_icicle_scalars(shares_icicle).unwrap()
@@ -118,7 +117,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        shares: &Vec<T::ArithmeticHalfShare>,
+        shares: &[T::ArithmeticHalfShare],
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
@@ -128,7 +127,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
-            unsafe { transmute::<&Vec<T::ArithmeticHalfShare>, &Vec<B::ArkScalarField>>(shares) };
+            unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
 
         let shares_icicle = from_host_slice(shares);
         ark_to_icicle_scalars(shares_icicle).unwrap()
