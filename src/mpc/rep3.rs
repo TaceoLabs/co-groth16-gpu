@@ -18,6 +18,7 @@ use mpc_core::{
     },
 };
 use mpc_net::Network;
+use rayon::prelude::*;
 
 use crate::{
     bridges::{
@@ -56,12 +57,10 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         a.a
     }
 
-    // TODO CESAR: Avoid copy
-    fn to_half_share_vec(a: &Self::DeviceShares) -> DeviceVec<F> {
-        let mut result =
-            DeviceVec::device_malloc(a.a.len()).expect("Failed to allocate device vector");
-        result.copy(&a.a).unwrap();
-        result
+    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F> {
+        // The `a` component alone is already a valid half share; move it out instead of
+        // allocating a fresh device buffer and copying into it.
+        a.a
     }
 
     fn promote_to_trivial_shares(
@@ -298,16 +297,19 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
         let host_a = to_host_vec_icicle_scalar(&shares.a)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
             .collect::<Vec<_>>();
         let host_b = to_host_vec_icicle_scalar(&shares.b)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
             .collect::<Vec<_>>();
 
         let shares = host_a
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .zip(host_b)
             .map(|(a, b)| Rep3PrimeFieldShare { a, b })
             .collect::<Vec<_>>();
@@ -322,16 +324,19 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
         let host_a = to_host_vec_icicle_scalar(shares)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
             .collect::<Vec<_>>();
 
         let (b, c) = net.broadcast_many(&host_a)?;
 
         Ok(host_a
-            .into_iter()
-            .zip(b.into_iter().zip(c))
-            .map(|(a, (b, c))| a + b + c)
+            .into_par_iter()
+            .with_min_len(1024)
+            .zip(b)
+            .zip(c)
+            .map(|((a, b), c)| a + b + c)
             .collect::<Vec<_>>())
     }
 }

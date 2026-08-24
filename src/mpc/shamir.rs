@@ -1,4 +1,7 @@
-use ark_ff::UniformRand;
+use std::{marker::PhantomData, mem::transmute, ops::IndexMut};
+
+use ark_ec::CurveGroup;
+use ark_ff::PrimeField;
 use icicle_core::{
     curve::{Affine, Curve},
     ntt::NTT,
@@ -9,37 +12,68 @@ use icicle_runtime::{
     memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice},
     stream::IcicleStream,
 };
-use mpc_core::MpcState;
+use mpc_core::{
+    MpcState,
+    protocols::shamir::{
+        ShamirPrimeFieldShare, ShamirState, arithmetic, network::ShamirNetworkExt, pointshare,
+    },
+};
 use mpc_net::Network;
-use rand::thread_rng;
 use rayon::prelude::*;
-use std::{mem::transmute, ops::IndexMut};
 
 use crate::{
-    bridges::{ArkIcicleBridge, ark_to_icicle_scalar, ark_to_icicle_scalars, icicle_to_ark_scalar},
+    bridges::{
+        ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar, ark_to_icicle_scalars,
+        icicle_to_ark_scalar,
+    },
     gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
 };
 
 use super::CircomGroth16Prover;
 
-/// A plain Groth16 driver
-pub struct PlainGroth16Driver;
+/// A Groth16 driver for Shamir secret sharing.
+///
+/// This driver is generic over the arkworks scalar field `Fr` used by the concrete
+/// `ArkIcicleBridge`, since (unlike Rep3) [`ShamirState`] carries field-dependent
+/// Lagrange coefficients and thus cannot be field-agnostic.
+pub struct ShamirGroth16Driver<Fr>(PhantomData<Fr>);
 
-impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConvertible>
-    CircomGroth16Prover<F> for PlainGroth16Driver
+/// Casts a `ShamirState<Fr>` to a `ShamirState<ArkF>`.
+///
+/// This is only sound when `Fr` and `ArkF` are the same type, which callers must
+/// guarantee by only ever using a bridge `B` whose `B::ArkScalarField` matches the
+/// driver's `Fr`.
+fn cast_state<Fr: PrimeField + 'static, ArkF: PrimeField + 'static>(
+    state: &mut ShamirState<Fr>,
+) -> &mut ShamirState<ArkF> {
+    assert_eq!(
+        std::any::TypeId::of::<Fr>(),
+        std::any::TypeId::of::<ArkF>(),
+        "Invalid bridge: ArkScalarField does not match driver's scalar field"
+    );
+    // SAFETY: checked above that Fr and ArkF are the same type
+    unsafe { transmute::<&mut ShamirState<Fr>, &mut ShamirState<ArkF>>(state) }
+}
+
+impl<F, Fr> CircomGroth16Prover<F> for ShamirGroth16Driver<Fr>
+where
+    F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConvertible,
+    Fr: PrimeField,
 {
     type ArithmeticShare = F;
 
     type DeviceShares = DeviceVec<F>;
     type DevicePointShares<C: Curve<ScalarField = F>> = DeviceVec<Affine<C>>;
 
-    type State = ();
+    type State = ShamirState<Fr>;
+
     fn to_half_share(a: &Self::ArithmeticShare) -> F {
         *a
     }
 
     fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F> {
-        // A plain share already *is* its half share, so there's nothing to convert.
+        // A degree-t Shamir share is already a valid degree-2t (half) share, so there's
+        // nothing to convert.
         a
     }
 
@@ -99,12 +133,13 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         shares: &[T::ArithmeticShare],
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
-            != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
+            != std::any::TypeId::of::<co_groth16::mpc::ShamirGroth16Driver>()
         {
-            panic!("Invalid driver: expected PlainGroth16Driver");
+            panic!("Invalid driver: expected ShamirGroth16Driver");
         }
 
-        // SAFETY: At this point we know the shares are safe to transmute
+        // SAFETY: At this point we know T::ArithmeticShare = ShamirPrimeFieldShare<B::ArkScalarField>,
+        // which is repr(transparent) over B::ArkScalarField.
         let shares = unsafe { transmute::<&[T::ArithmeticShare], &[B::ArkScalarField]>(shares) };
 
         let shares_icicle = from_host_slice(shares);
@@ -116,11 +151,11 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
-    ) -> Self::DeviceShares {
+    ) -> DeviceVec<F> {
         if std::any::TypeId::of::<T>()
-            != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
+            != std::any::TypeId::of::<co_groth16::mpc::ShamirGroth16Driver>()
         {
-            panic!("Invalid driver: expected PlainGroth16Driver");
+            panic!("Invalid driver: expected ShamirGroth16Driver");
         }
 
         // SAFETY: At this point we know the shares are safe to transmute
@@ -159,60 +194,102 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     }
 
     fn rand<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        _: &N,
-        _: &mut Self::State,
+        net: &N,
+        state: &mut Self::State,
     ) -> eyre::Result<Self::ArithmeticShare> {
-        let mut rng = thread_rng();
-        let res = B::ArkScalarField::rand(&mut rng);
-        Ok(ark_to_icicle_scalar(res))
+        let state = cast_state::<Fr, B::ArkScalarField>(state);
+        let res = state.rand(net)?;
+        Ok(ark_to_icicle_scalar(res.inner()))
     }
 
     fn open_half_point_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: Affine<B::IcicleG1>,
-        _: &N,
-        _: &mut Self::State,
+        net: &N,
+        state: &mut Self::State,
     ) -> eyre::Result<Affine<B::IcicleG1>> {
-        Ok(a)
+        let ark_a = B::icicle_to_ark_g1(a);
+        let state = cast_state::<Fr, B::ArkScalarField>(state);
+        let open_a = pointshare::open_half_point(ark_a.into(), net, state)?.into_affine();
+        Ok(ark_to_icicle_affine(&open_a))
     }
 
     fn open_half_point_g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: Affine<B::IcicleG2>,
-        _: &N,
-        _: &mut Self::State,
+        net: &N,
+        state: &mut Self::State,
     ) -> eyre::Result<Affine<B::IcicleG2>> {
-        Ok(a)
+        let ark_a = B::icicle_to_ark_g2(a);
+        let state = cast_state::<Fr, B::ArkScalarField>(state);
+        let open_a = pointshare::open_half_point(ark_a.into(), net, state)?.into_affine();
+        Ok(ark_to_icicle_affine(&open_a))
     }
 
     fn scalar_mul_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: &Affine<B::IcicleG1>,
         b: Self::ArithmeticShare,
-        _: &N,
-        _: &mut Self::State,
+        net: &N,
+        state: &mut Self::State,
     ) -> eyre::Result<Affine<B::IcicleG1>> {
-        Ok((a.to_projective() * b).into())
+        let ark_a = B::icicle_to_ark_g1(*a).into();
+        let state = cast_state::<Fr, B::ArkScalarField>(state);
+        let reduced = net.degree_reduce_point(state, ark_a)?;
+        let b_ark: B::ArkScalarField = icicle_to_ark_scalar(b);
+        let res =
+            pointshare::scalar_mul_local(&reduced, ShamirPrimeFieldShare::new(b_ark)).into_affine();
+        Ok(ark_to_icicle_affine(&res))
     }
 
     fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         shares: &Self::DeviceShares,
-        _: &N,
-        _: &mut Self::State,
+        net: &N,
+        state: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
-        Ok(to_host_vec_icicle_scalar(shares)
+        let host_a = to_host_vec_icicle_scalar(shares)
             .into_par_iter()
             .with_min_len(1024)
-            .map(icicle_to_ark_scalar)
-            .collect::<Vec<_>>())
+            .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
+            .collect::<Vec<_>>();
+
+        let shares = ShamirPrimeFieldShare::convert_vec_rev(host_a);
+        let state = cast_state::<Fr, B::ArkScalarField>(state);
+        let opened = arithmetic::open_vec(&shares, net, state)?;
+
+        Ok(opened)
     }
 
     fn open_device_half_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         shares: &DeviceVec<F>,
-        _: &N,
-        _: &mut Self::State,
+        net: &N,
+        state: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
-        Ok(to_host_vec_icicle_scalar(shares)
+        let host_a = to_host_vec_icicle_scalar(shares)
             .into_par_iter()
             .with_min_len(1024)
-            .map(icicle_to_ark_scalar)
-            .collect::<Vec<_>>())
+            .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
+            .collect::<Vec<_>>();
+
+        let state = cast_state::<Fr, B::ArkScalarField>(state);
+
+        // Values passed through `local_mul_vec`/`local_mul` are degree-2t shares, so opening
+        // them requires 2t+1 shares and the corresponding Lagrange coefficients, unlike
+        // `open_device_shares` which opens ordinary degree-t shares.
+        let rcv = net.broadcast_next(state.num_parties, 2 * state.threshold + 1, host_a)?;
+
+        // Reconstruct each element as a dot product over the (few, `2t+1`-sized) received rows,
+        // parallelizing over `len` (typically domain- or witness-sized) rather than over the
+        // rows, and without ever materializing a `len`-sized transpose.
+        let len = rcv.first().map_or(0, Vec::len);
+        let result = (0..len)
+            .into_par_iter()
+            .with_min_len(1024)
+            .map(|i| {
+                rcv.iter()
+                    .zip(state.open_lagrange_2t.iter())
+                    .map(|(row, coeff)| row[i] * coeff)
+                    .sum()
+            })
+            .collect();
+
+        Ok(result)
     }
 }

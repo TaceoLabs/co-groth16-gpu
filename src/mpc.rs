@@ -1,6 +1,6 @@
 pub(crate) mod plain;
 pub(crate) mod rep3;
-// pub(crate) mod shamir;
+pub(crate) mod shamir;
 
 use std::mem::transmute;
 
@@ -25,7 +25,7 @@ use crate::{
 
 pub use plain::PlainGroth16Driver;
 pub use rep3::Rep3Groth16Driver;
-// pub use shamir::ShamirGroth16Driver;
+pub use shamir::ShamirGroth16Driver;
 
 /// This trait represents the operations used during Groth16 proof generation
 pub trait CircomGroth16Prover<
@@ -76,7 +76,7 @@ pub trait CircomGroth16Prover<
     fn to_half_share(a: &Self::ArithmeticShare) -> F;
 
     /// Converts shared values to half shared values. Local interaction only.
-    fn to_half_share_vec(a: &Self::DeviceShares) -> DeviceVec<F>;
+    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F>;
 
     /// Add a public point B in place to the shared point A
     fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
