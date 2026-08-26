@@ -325,7 +325,7 @@ mod tests {
                             co_groth16::Rep3CoGroth16::<Bn254>::prove::<
                                 LocalNetwork,
                                 co_groth16::CircomReduction,
-                            >(&net0, &net1, pkey, matrices, witness)
+                            >(&net0, pkey, matrices, witness)
                         };
 
                         let gpu_prove = |pkey, prepared_key, matrices, witness| {
@@ -426,7 +426,7 @@ mod tests {
                         co_groth16::Rep3CoGroth16::<Bn254>::prove::<
                             LocalNetwork,
                             co_groth16::CircomReduction,
-                        >(&net0, &net1, pkey, matrices, witness)
+                        >(&net0, pkey, matrices, witness)
                     };
 
                     let gpu_prove = |pkey, prepared_key, matrices, witness| {

@@ -19,15 +19,15 @@ ark-groth16 = "0.6"
 ark-poly = "0.6"
 ark-relations = "0.6"
 ark-serialize = { version = "0.6", features = ["derive", "std"] }
-co-circom-types = { git = "https://github.com/TaceoLabs/co-snarks", rev = "c062afd71540cca659e655aa1a4221fe4cb4d15f" }
-co-groth16 = { git = "https://github.com/TaceoLabs/co-snarks", rev = "c062afd71540cca659e655aa1a4221fe4cb4d15f" }
+co-circom-types = { git = "https://github.com/TaceoLabs/co-snarks", rev = "b95c341ca5bf3b56fb0ea99fff7b31621a9ae197" }
+co-groth16 = { git = "https://github.com/TaceoLabs/co-snarks", rev = "b95c341ca5bf3b56fb0ea99fff7b31621a9ae197" }
 eyre = "0.6"
 icicle-core = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
 icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
 icicle-bn254 = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
 icicle-bls12-377 = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
-mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", rev = "c062afd71540cca659e655aa1a4221fe4cb4d15f" }
-mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", rev = "c062afd71540cca659e655aa1a4221fe4cb4d15f", features = [
+mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", rev = "b95c341ca5bf3b56fb0ea99fff7b31621a9ae197" }
+mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", rev = "b95c341ca5bf3b56fb0ea99fff7b31621a9ae197", features = [
     "local",
 ] }
 num-traits = { version = "0.2.18", default-features = false }
