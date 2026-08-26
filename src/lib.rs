@@ -132,31 +132,29 @@ mod tests {
     }
 
     fn dummy_prove<P: ark_ec::pairing::Pairing>(
-        net0: &LocalNetwork,
-        net1: &LocalNetwork,
+        net: &LocalNetwork,
         _pkey: &ProvingKey<P>,
         _prepared_key: Option<Arc<Bn254PreparedKey>>,
         _matrices: &ConstraintMatrices<P::ScalarField>,
         _witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
     ) -> eyre::Result<()> {
-        let _ = Rep3State::new(net0, A2BType::default()).unwrap();
+        let _ = Rep3State::new(net, A2BType::default()).unwrap();
 
         // Dummy network operations
 
-        // Open g_a (G1)
-        net0.broadcast(P::G1Affine::rand(&mut thread_rng()))
-            .unwrap();
+        // Open (g_a, g1_b) in one round (both G1)
+        net.broadcast((
+            P::G1Affine::rand(&mut thread_rng()),
+            P::G1Affine::rand(&mut thread_rng()),
+        ))
+        .unwrap();
 
-        // Scalar Mul g1_b * r
-        net1.reshare(P::G1Affine::rand(&mut thread_rng())).unwrap();
-
-        // Open g_c (G1)
-        net0.broadcast(P::G1Affine::rand(&mut thread_rng()))
-            .unwrap();
-
-        // Open g_2_b (G2)
-        net1.broadcast(P::G2Affine::rand(&mut thread_rng()))
-            .unwrap();
+        // Open (g_c, g2_b) in one round (G1, G2)
+        net.broadcast((
+            P::G1Affine::rand(&mut thread_rng()),
+            P::G2Affine::rand(&mut thread_rng()),
+        ))
+        .unwrap();
 
         Ok(())
     }
@@ -307,31 +305,28 @@ mod tests {
             let [witness_share1, witness_share2, witness_share3] =
                 SharedWitness::share_rep3(witness, zkey1.0.num_instance_variables, &mut rng);
 
-            let nets0 = LocalNetwork::new_3_parties();
-            let nets1 = LocalNetwork::new_3_parties();
+            let nets = LocalNetwork::new_3_parties();
 
             let mut threads = vec![];
-            for (net0, net1, x, zkey) in izip!(
-                nets0,
-                nets1,
+            for (net, x, zkey) in izip!(
+                nets,
                 [witness_share1, witness_share2, witness_share3].into_iter(),
                 [zkey1, zkey2, zkey3].into_iter()
             ) {
                 threads.push(std::thread::spawn(move || {
-                    if net0.id() == 0 {
+                    if net.id() == 0 {
                         load_backend_from_env_and_set_device(0);
 
                         let cpu_prove = |pkey, matrices, witness| {
                             co_groth16::Rep3CoGroth16::<Bn254>::prove::<
                                 LocalNetwork,
                                 co_groth16::CircomReduction,
-                            >(&net0, pkey, matrices, witness)
+                            >(&net, pkey, matrices, witness)
                         };
 
                         let gpu_prove = |pkey, prepared_key, matrices, witness| {
                             Rep3CoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
-                                &net0,
-                                &net1,
+                                &net,
                                 pkey,
                                 prepared_key,
                                 matrices,
@@ -356,18 +351,11 @@ mod tests {
                         );
                     } else {
                         let cpu_prove = |pkey, matrices, witness| {
-                            dummy_prove::<Bn254>(&net0, &net1, pkey, None, matrices, witness)
+                            dummy_prove::<Bn254>(&net, pkey, None, matrices, witness)
                         };
 
                         let gpu_prove = |pkey, prepared_key, matrices, witness| {
-                            dummy_prove::<Bn254>(
-                                &net0,
-                                &net1,
-                                pkey,
-                                prepared_key,
-                                matrices,
-                                witness,
-                            )
+                            dummy_prove::<Bn254>(&net, pkey, prepared_key, matrices, witness)
                         };
 
                         run_provers!(
@@ -422,13 +410,11 @@ mod tests {
                 &mut rng,
             );
 
-            let nets0 = LocalNetwork::new(NUM_PARTIES);
-            let nets1 = LocalNetwork::new(NUM_PARTIES);
+            let nets = LocalNetwork::new(NUM_PARTIES);
 
             let mut threads = vec![];
-            for (net0, net1, x, zkey) in izip!(
-                nets0,
-                nets1,
+            for (net, x, zkey) in izip!(
+                nets,
                 witness_shares.into_iter(),
                 [zkey1, zkey2, zkey3].into_iter()
             ) {
@@ -441,23 +427,16 @@ mod tests {
                             LocalNetwork,
                             co_groth16::CircomReduction,
                         >(
-                            &net0,
-                            &net1,
-                            NUM_PARTIES,
-                            THRESHOLD,
-                            pkey,
-                            matrices,
-                            witness,
+                            &net, NUM_PARTIES, THRESHOLD, pkey, matrices, witness
                         )
                     };
 
-                    if net0.id() == 0 {
+                    if net.id() == 0 {
                         load_backend_from_env_and_set_device(0);
 
                         let gpu_prove = |pkey, prepared_key, matrices, witness| {
                             ShamirCoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
-                                &net0,
-                                &net1,
+                                &net,
                                 NUM_PARTIES,
                                 THRESHOLD,
                                 pkey,
@@ -491,13 +470,7 @@ mod tests {
                                 LocalNetwork,
                                 co_groth16::CircomReduction,
                             >(
-                                &net0,
-                                &net1,
-                                NUM_PARTIES,
-                                THRESHOLD,
-                                pkey,
-                                matrices,
-                                witness,
+                                &net, NUM_PARTIES, THRESHOLD, pkey, matrices, witness
                             )
                         };
 
@@ -542,13 +515,11 @@ mod tests {
             let [witness_share1, witness_share2, witness_share3] =
                 SharedWitness::share_rep3(witness, zkey1.0.num_instance_variables, &mut rng);
 
-            let nets0 = LocalNetwork::new_3_parties();
-            let nets1 = LocalNetwork::new_3_parties();
+            let nets = LocalNetwork::new_3_parties();
 
             let mut threads = vec![];
-            for (net0, net1, x, zkey) in izip!(
-                nets0,
-                nets1,
+            for (net, x, zkey) in izip!(
+                nets,
                 [witness_share1, witness_share2, witness_share3].into_iter(),
                 [zkey1, zkey2, zkey3].into_iter()
             ) {
@@ -557,13 +528,12 @@ mod tests {
                         co_groth16::Rep3CoGroth16::<Bn254>::prove::<
                             LocalNetwork,
                             co_groth16::CircomReduction,
-                        >(&net0, pkey, matrices, witness)
+                        >(&net, pkey, matrices, witness)
                     };
 
                     let gpu_prove = |pkey, prepared_key, matrices, witness| {
                         Rep3CoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
-                            &net0,
-                            &net1,
+                            &net,
                             pkey,
                             prepared_key,
                             matrices,
@@ -578,7 +548,7 @@ mod tests {
                         prepared_key = None,
                         matrices = &zkey.0,
                         witness = x,
-                        silent = net0.id() != 0 // only print for the first party to avoid cluttering the output
+                        silent = net.id() != 0 // only print for the first party to avoid cluttering the output
                     );
                 }));
             }

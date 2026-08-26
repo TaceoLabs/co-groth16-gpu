@@ -202,41 +202,38 @@ where
         Ok(ark_to_icicle_scalar(res.inner()))
     }
 
-    fn open_half_point_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+    fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG1>,
         net: &N,
         state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>> {
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)> {
         let ark_a = B::icicle_to_ark_g1(a);
+        let ark_b = B::icicle_to_ark_g1(b);
         let state = cast_state::<Fr, B::ArkScalarField>(state);
-        let open_a = pointshare::open_half_point(ark_a.into(), net, state)?.into_affine();
-        Ok(ark_to_icicle_affine(&open_a))
+        let (open_a, open_b) =
+            pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net, state)?;
+        Ok((
+            ark_to_icicle_affine(&open_a.into_affine()),
+            ark_to_icicle_affine(&open_b.into_affine()),
+        ))
     }
 
-    fn open_half_point_g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG2>,
+    fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG2>,
         net: &N,
         state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG2>> {
-        let ark_a = B::icicle_to_ark_g2(a);
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)> {
+        let ark_a = B::icicle_to_ark_g1(a);
+        let ark_b = B::icicle_to_ark_g2(b);
         let state = cast_state::<Fr, B::ArkScalarField>(state);
-        let open_a = pointshare::open_half_point(ark_a.into(), net, state)?.into_affine();
-        Ok(ark_to_icicle_affine(&open_a))
-    }
-
-    fn scalar_mul_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: &Affine<B::IcicleG1>,
-        b: Self::ArithmeticShare,
-        net: &N,
-        state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>> {
-        let ark_a = B::icicle_to_ark_g1(*a).into();
-        let state = cast_state::<Fr, B::ArkScalarField>(state);
-        let reduced = net.degree_reduce_point(state, ark_a)?;
-        let b_ark: B::ArkScalarField = icicle_to_ark_scalar(b);
-        let res =
-            pointshare::scalar_mul_local(&reduced, ShamirPrimeFieldShare::new(b_ark)).into_affine();
-        Ok(ark_to_icicle_affine(&res))
+        let (open_a, open_b) =
+            pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net, state)?;
+        Ok((
+            ark_to_icicle_affine(&open_a.into_affine()),
+            ark_to_icicle_affine(&open_b.into_affine()),
+        ))
     }
 
     fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
