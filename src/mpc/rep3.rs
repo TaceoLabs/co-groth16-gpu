@@ -57,12 +57,10 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         a.a
     }
 
-    // TODO CESAR: Avoid copy
-    fn to_half_share_vec(a: &Self::DeviceShares) -> DeviceVec<F> {
-        let mut result =
-            DeviceVec::device_malloc(a.a.len()).expect("Failed to allocate device vector");
-        result.copy(&a.a).unwrap();
-        result
+    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F> {
+        // The `a` component alone is already a valid half share; move it out instead of
+        // allocating a fresh device buffer and copying into it.
+        a.a
     }
 
     fn promote_to_trivial_shares(
