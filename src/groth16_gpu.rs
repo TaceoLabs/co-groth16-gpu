@@ -172,7 +172,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             T::rand::<_, B>(net0, state0)?,
         );
 
-        let private_witness_half_shares = T::to_half_share_vec(&private_witness);
+        let private_witness_half_shares = T::to_half_share_vec(private_witness);
 
         Self::create_proof_with_assignment(
             net0,

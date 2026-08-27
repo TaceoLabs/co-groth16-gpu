@@ -76,7 +76,7 @@ pub trait CircomGroth16Prover<
     fn to_half_share(a: &Self::ArithmeticShare) -> F;
 
     /// Converts shared values to half shared values. Local interaction only.
-    fn to_half_share_vec(a: &Self::DeviceShares) -> DeviceVec<F>;
+    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F>;
 
     /// Add a public point B in place to the shared point A
     fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
