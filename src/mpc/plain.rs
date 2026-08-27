@@ -167,29 +167,22 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         Ok(ark_to_icicle_scalar(res))
     }
 
-    fn open_half_point_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+    fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG1>,
         _: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>> {
-        Ok(a)
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)> {
+        Ok((a, b))
     }
 
-    fn open_half_point_g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG2>,
+    fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG2>,
         _: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG2>> {
-        Ok(a)
-    }
-
-    fn scalar_mul_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: &Affine<B::IcicleG1>,
-        b: Self::ArithmeticShare,
-        _: &N,
-        _: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>> {
-        Ok((a.to_projective() * b).into())
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)> {
+        Ok((a, b))
     }
 
     fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(

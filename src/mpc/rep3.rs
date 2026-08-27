@@ -13,9 +13,7 @@ use icicle_runtime::{
 };
 use mpc_core::{
     MpcState,
-    protocols::rep3::{
-        Rep3PointShare, Rep3PrimeFieldShare, Rep3State, arithmetic, id::PartyID, pointshare,
-    },
+    protocols::rep3::{Rep3PrimeFieldShare, Rep3State, arithmetic, id::PartyID, pointshare},
 };
 use mpc_net::Network;
 use rayon::prelude::*;
@@ -249,45 +247,34 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         })
     }
 
-    fn open_half_point_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+    fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG1>,
         net: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>> {
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)> {
         let ark_a = B::icicle_to_ark_g1(a);
-        let open_a = pointshare::open_half_point(ark_a.into(), net)?.into_affine();
-        Ok(ark_to_icicle_affine(&open_a))
+        let ark_b = B::icicle_to_ark_g1(b);
+        let (open_a, open_b) = pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net)?;
+        Ok((
+            ark_to_icicle_affine(&open_a.into_affine()),
+            ark_to_icicle_affine(&open_b.into_affine()),
+        ))
     }
 
-    fn open_half_point_g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG2>,
+    fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG2>,
         net: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG2>> {
-        let ark_a = B::icicle_to_ark_g2(a);
-        let open_a = pointshare::open_half_point(ark_a.into(), net)?.into_affine();
-        Ok(ark_to_icicle_affine(&open_a))
-    }
-
-    fn scalar_mul_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: &Affine<B::IcicleG1>,
-        b: Self::ArithmeticShare,
-        net: &N,
-        state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>> {
-        let ark_a = B::icicle_to_ark_g1(*a);
-        let a_hs = net.reshare(ark_a)?;
-        let point = Rep3PointShare::new(ark_a.into(), a_hs.into());
-        let res = pointshare::scalar_mul_local(
-            &point,
-            Rep3PrimeFieldShare {
-                a: icicle_to_ark_scalar(b.a),
-                b: icicle_to_ark_scalar(b.b),
-            },
-            state,
-        )
-        .into_affine();
-        Ok(ark_to_icicle_affine(&res))
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)> {
+        let ark_a = B::icicle_to_ark_g1(a);
+        let ark_b = B::icicle_to_ark_g2(b);
+        let (open_a, open_b) = pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net)?;
+        Ok((
+            ark_to_icicle_affine(&open_a.into_affine()),
+            ark_to_icicle_affine(&open_b.into_affine()),
+        ))
     }
 
     // TODO CESAR: remove

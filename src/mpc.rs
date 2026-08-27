@@ -201,27 +201,23 @@ pub trait CircomGroth16Prover<
         state: &mut Self::State,
     ) -> eyre::Result<Self::ArithmeticShare>;
 
-    /// Reconstructs a shared point in G1: A = Open(\[A\]).
-    fn open_half_point_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+    /// Reconstructs two shared points in G1 in a single communication round:
+    /// (A, B) = (Open(\[A\]), Open(\[B\])).
+    fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG1>,
         net: &N,
         state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>>;
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)>;
 
-    /// Reconstructs a shared point in G2: A = Open(\[A\]).
-    fn open_half_point_g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG2>,
+    /// Reconstructs a shared point in G1 together with a shared point in G2 in a single
+    /// communication round: (A, B) = (Open(\[A\]), Open(\[B\])).
+    fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
+        a: Affine<B::IcicleG1>,
+        b: Affine<B::IcicleG2>,
         net: &N,
         state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG2>>;
-
-    /// Multiplies a share b to the shared point A: \[A\] *= \[b\]. Requires network communication.
-    fn scalar_mul_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: &Affine<B::IcicleG1>,
-        b: Self::ArithmeticShare,
-        net: &N,
-        state: &mut Self::State,
-    ) -> eyre::Result<Affine<B::IcicleG1>>;
+    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)>;
 
     fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         shares: &Self::DeviceShares,
