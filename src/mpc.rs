@@ -102,23 +102,35 @@ pub trait CircomGroth16Prover<
 
     // ICICLE <-> ARK functions
 
-    /// Converts a vector of arithmetic shares to device shares.
+    /// Converts a vector of arithmetic shares to device shares. Runs asynchronously on `stream`;
+    /// the caller is responsible for synchronizing before relying on the result from a different
+    /// stream (or from the host).
     fn shares_to_device<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
+        stream: &IcicleStream,
     ) -> Self::DeviceShares;
 
-    /// Converts a vector of arithmetic shares to device shares.
+    /// Converts a vector of arithmetic shares to device shares. Runs asynchronously on `stream`;
+    /// the caller is responsible for synchronizing before relying on the result from a different
+    /// stream (or from the host).
     fn half_shares_to_device<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
+        stream: &IcicleStream,
     ) -> DeviceVec<F>;
 
     /// Evaluates the constraints for a given party ID and transforms the results into device shares.
+    ///
+    /// `stream_a`/`stream_b`/`stream_c` are used for the respective `a`/`b`/`c` uploads. Since the
+    /// upload dispatch is asynchronous, the CPU-bound evaluation of the next constraint set
+    /// overlaps with the GPU-bound upload of the previous one; the caller must synchronize the
+    /// three streams before relying on the results from a different stream (or from the host).
+    #[expect(clippy::too_many_arguments)]
     fn evaluate_constraints<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
@@ -129,6 +141,9 @@ pub trait CircomGroth16Prover<
         private_witness: &[T::ArithmeticShare],
         eval_c: bool,
         domain_size: usize,
+        stream_a: &IcicleStream,
+        stream_b: &IcicleStream,
+        stream_c: &IcicleStream,
     ) -> (
         Self::DeviceShares,
         Self::DeviceShares,
@@ -145,7 +160,7 @@ pub trait CircomGroth16Prover<
             public_inputs,
             private_witness,
         );
-        let eval_a = Self::shares_to_device::<B, T>(&eval_a);
+        let eval_a = Self::shares_to_device::<B, T>(&eval_a, stream_a);
 
         let eval_b = evaluate_constraint::<B::ArkPairing, T>(
             *id,
@@ -154,7 +169,7 @@ pub trait CircomGroth16Prover<
             public_inputs,
             private_witness,
         );
-        let eval_b = Self::shares_to_device::<B, T>(&eval_b);
+        let eval_b = Self::shares_to_device::<B, T>(&eval_b, stream_b);
 
         let eval_c = if eval_c {
             let eval_c = evaluate_constraint_half_share::<B::ArkPairing, T>(
@@ -164,7 +179,7 @@ pub trait CircomGroth16Prover<
                 public_inputs,
                 private_witness,
             );
-            Some(Self::half_shares_to_device::<B, T>(&eval_c))
+            Some(Self::half_shares_to_device::<B, T>(&eval_c, stream_c))
         } else {
             None
         };

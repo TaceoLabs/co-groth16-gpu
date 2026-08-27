@@ -1,6 +1,6 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
 use crate::gpu_utils::{
-    PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, from_host_slice, get_first, msm_async,
+    PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, from_host_slice_async, get_first, msm_async,
 };
 use ark_bn254::Bn254;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
@@ -9,11 +9,13 @@ use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
 use icicle_core::curve::{Affine, Curve, Projective};
 use icicle_runtime::memory::DeviceVec;
+use icicle_runtime::stream::IcicleStream;
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_core::protocols::shamir::{ShamirPreprocessing, ShamirPrimeFieldShare, ShamirState};
 use mpc_net::Network;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::{marker::PhantomData, mem::transmute};
 
@@ -28,6 +30,53 @@ use crate::mpc::shamir::ShamirGroth16Driver;
 
 pub use reduction::{CircomReduction, LibSnarkReduction, R1CSToQAP};
 mod reduction;
+
+/// The five host->device uploads performed in [`CoGroth16Icicle::setup`] (`eval_a`, `eval_b`,
+/// `eval_c`, the private witness, and the public inputs) are mutually independent, so each gets
+/// its own stream: dispatching them asynchronously lets the transfers overlap with each other and
+/// with the CPU-bound rayon constraint evaluation still running for the next matrix. Cached
+/// thread-locally (like [`ReductionStreams`](reduction), avoids paying CUDA stream
+/// create/destroy cost on every proof.
+struct SetupStreams {
+    eval_a: IcicleStream,
+    eval_b: IcicleStream,
+    eval_c: IcicleStream,
+    witness: IcicleStream,
+    public: IcicleStream,
+}
+
+impl SetupStreams {
+    fn new() -> Self {
+        Self {
+            eval_a: IcicleStream::create().unwrap(),
+            eval_b: IcicleStream::create().unwrap(),
+            eval_c: IcicleStream::create().unwrap(),
+            witness: IcicleStream::create().unwrap(),
+            public: IcicleStream::create().unwrap(),
+        }
+    }
+}
+
+impl Drop for SetupStreams {
+    fn drop(&mut self) {
+        let _ = self.eval_a.destroy();
+        let _ = self.eval_b.destroy();
+        let _ = self.eval_c.destroy();
+        let _ = self.witness.destroy();
+        let _ = self.public.destroy();
+    }
+}
+
+thread_local! {
+    static SETUP_STREAMS: RefCell<SetupStreams> = RefCell::new(SetupStreams::new());
+}
+
+// Cached the same way as `SETUP_STREAMS` / `ReductionStreams`: `ProofStreams` was previously
+// created and destroyed on every single call to `create_proof_with_assignment`, i.e. every proof
+// paid CUDA stream create/destroy cost.
+thread_local! {
+    static PROOF_STREAMS: RefCell<ProofStreams> = RefCell::new(ProofStreams::new());
+}
 
 /// The plain [`Groth16`] type.
 ///
@@ -96,6 +145,18 @@ pub fn prepare_bls12_377_key<R: R1CSToQAP>(
     )
 }
 
+/// Holds the 7 of the proof's 8 MSMs that don't depend on `h`, dispatched (but not yet
+/// synchronized/read) by [`CoGroth16Icicle::dispatch_independent_msms`].
+struct IndependentMsms<C1: Curve, C2: Curve<ScalarField = C1::ScalarField>> {
+    pub_acc_r_g1: DeviceVec<Projective<C1>>,
+    priv_acc_r_g1: DeviceVec<Projective<C1>>,
+    pub_acc_s_g1: DeviceVec<Projective<C1>>,
+    priv_acc_s_g1: DeviceVec<Projective<C1>>,
+    pub_acc_s_g2: DeviceVec<Projective<C2>>,
+    priv_acc_s_g2: DeviceVec<Projective<C2>>,
+    l_acc: DeviceVec<Projective<C1>>,
+}
+
 impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16Icicle<B, T> {
     #[expect(clippy::type_complexity)]
     fn setup<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static, R: R1CSToQAP>(
@@ -113,34 +174,57 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     )> {
         let setup_timer = std::time::Instant::now();
 
-        let eval_timer = std::time::Instant::now();
-        let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
-            id,
-            matrices,
-            public_inputs,
-            private_witness,
-            R::requires_eval_c(),
-            domain_size,
-        );
-        let eval_elapsed = eval_timer.elapsed();
+        let result = SETUP_STREAMS.with(|streams| {
+            let streams = streams.borrow();
 
-        let witness_timer = std::time::Instant::now();
-        let private_witness = T::shares_to_device::<B, U>(private_witness);
-        let witness_elapsed = witness_timer.elapsed();
+            // Dispatch all five uploads asynchronously. `evaluate_constraints` interleaves the
+            // CPU-bound rayon evaluation of the next matrix with the async upload dispatch of the
+            // previous one; the witness/public-input uploads run concurrently with all of it on
+            // their own streams.
+            let dispatch_timer = std::time::Instant::now();
+            let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
+                id,
+                matrices,
+                public_inputs,
+                private_witness,
+                R::requires_eval_c(),
+                domain_size,
+                &streams.eval_a,
+                &streams.eval_b,
+                &streams.eval_c,
+            );
 
-        let public_timer = std::time::Instant::now();
-        let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
-        let public_elapsed = public_timer.elapsed();
+            let private_witness =
+                T::shares_to_device::<B, U>(private_witness, &streams.witness);
 
-        tracing::info!(
-            "Setup timings: evaluate_constraints={} ms, witness_to_device={} ms, public_to_device={} ms, total={} ms",
-            eval_elapsed.as_millis(),
-            witness_elapsed.as_millis(),
-            public_elapsed.as_millis(),
-            setup_timer.elapsed().as_millis()
-        );
+            let public_inputs = ark_to_icicle_scalars(
+                from_host_slice_async(public_inputs, &streams.public),
+                &streams.public,
+            )
+            .unwrap();
+            let dispatch_elapsed = dispatch_timer.elapsed();
 
-        Ok((eval_a, eval_b, eval_c, public_inputs, private_witness))
+            // Join point: reduction.rs and the MSM stage each use their own separate streams, so
+            // drain all five here before handing the results off.
+            let sync_timer = std::time::Instant::now();
+            streams.eval_a.synchronize().unwrap();
+            streams.eval_b.synchronize().unwrap();
+            streams.eval_c.synchronize().unwrap();
+            streams.witness.synchronize().unwrap();
+            streams.public.synchronize().unwrap();
+            let sync_elapsed = sync_timer.elapsed();
+
+            tracing::info!(
+                "Setup timings: dispatch (CPU eval + async upload)={} ms, stream sync={} ms, total={} ms",
+                dispatch_elapsed.as_millis(),
+                sync_elapsed.as_millis(),
+                setup_timer.elapsed().as_millis()
+            );
+
+            (eval_a, eval_b, eval_c, public_inputs, private_witness)
+        });
+
+        Ok(result)
     }
 
     /// Execute the Groth16 prover using the internal MPC driver.
@@ -156,6 +240,15 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         private_witness: T::DeviceShares,
         public_inputs: &DeviceVec<B::IcicleScalarField>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+        // Of the 8 MSMs the proof needs, 7 depend only on `public_inputs`/the private witness
+        // (both already available here), not on `h`. Dispatch those 7 now, async on their own
+        // streams, so they run on the GPU concurrently with the witness-map FFTs below instead of
+        // strictly after them; only `h_acc`'s MSM has to wait for `h` (see
+        // `finish_proof_with_assignment`).
+        let private_witness_half_shares = T::to_half_share_vec(private_witness);
+        let msms =
+            Self::dispatch_independent_msms(pkey, public_inputs, &private_witness_half_shares);
+
         let timer_start = std::time::Instant::now();
         let h = R::witness_map_from_r1cs_eval::<B, T>(
             state,
@@ -174,18 +267,93 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
 
-        let private_witness_half_shares = T::to_half_share_vec(private_witness);
+        Self::finish_proof_with_assignment(net, state, pkey, r, s, h, msms)
+    }
 
-        Self::create_proof_with_assignment(
-            net,
-            state,
-            pkey,
-            r,
-            s,
-            h,
-            public_inputs,
-            &private_witness_half_shares,
-        )
+    /// Dispatches (asynchronously, without synchronizing) the 7 of the proof's 8 MSMs that don't
+    /// depend on `h`. See `finish_proof_with_assignment` for where these are joined back in.
+    fn dispatch_independent_msms(
+        pkey: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
+        input_assignment: &DeviceVec<B::IcicleScalarField>,
+        aux_assignment: &DeviceVec<B::IcicleScalarField>,
+    ) -> IndependentMsms<B::IcicleG1, B::IcicleG2> {
+        let ProvingKey {
+            a_query_pub,
+            a_query_priv,
+            b_g1_query_pub,
+            b_g1_query_priv,
+            b_g2_query_pub,
+            b_g2_query_priv,
+            l_query,
+            ..
+        } = pkey;
+
+        PROOF_STREAMS.with(|streams| {
+            let streams = streams.borrow();
+            let stream_g1 = &streams.g1;
+            let stream_g2 = &streams.g2;
+
+            // Compute A
+            let (pub_acc_r_g1, priv_acc_r_g1) = (
+                msm_async(
+                    a_query_pub,
+                    &input_assignment[1..],
+                    stream_g1,
+                    PRECOMPUTE_FACTOR_G1,
+                ),
+                msm_async(
+                    a_query_priv,
+                    aux_assignment,
+                    stream_g1,
+                    PRECOMPUTE_FACTOR_G1,
+                ),
+            );
+
+            // Compute B in G1
+            let (pub_acc_s_g1, priv_acc_s_g1) = (
+                msm_async(
+                    b_g1_query_pub,
+                    &input_assignment[1..],
+                    stream_g1,
+                    PRECOMPUTE_FACTOR_G1,
+                ),
+                msm_async(
+                    b_g1_query_priv,
+                    aux_assignment,
+                    stream_g1,
+                    PRECOMPUTE_FACTOR_G1,
+                ),
+            );
+
+            // Compute B in G2
+            let (pub_acc_s_g2, priv_acc_s_g2) = (
+                msm_async(
+                    b_g2_query_pub,
+                    &input_assignment[1..],
+                    stream_g2,
+                    PRECOMPUTE_FACTOR_G2,
+                ),
+                msm_async(
+                    b_g2_query_priv,
+                    aux_assignment,
+                    stream_g2,
+                    PRECOMPUTE_FACTOR_G2,
+                ),
+            );
+
+            // Compute msm(l_query, aux_assignment)
+            let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
+
+            IndependentMsms {
+                pub_acc_r_g1,
+                priv_acc_r_g1,
+                pub_acc_s_g1,
+                priv_acc_s_g1,
+                pub_acc_s_g2,
+                priv_acc_s_g2,
+                l_acc,
+            }
+        })
     }
 
     fn calculate_coeff<C>(
@@ -206,16 +374,16 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         (res.to_projective() + priv_acc.to_projective()).into()
     }
 
-    #[expect(clippy::too_many_arguments)]
-    fn create_proof_with_assignment<N: Network>(
+    /// Joins the 7 independently-dispatched MSMs from `dispatch_independent_msms` with the
+    /// 8th (`msm(h_query, h)`, which had to wait for `h`) and assembles the proof.
+    fn finish_proof_with_assignment<N: Network>(
         net: &N,
         state: &mut T::State,
         pkey: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
         r: T::ArithmeticShare,
         s: T::ArithmeticShare,
         h: DeviceVec<B::IcicleScalarField>,
-        input_assignment: &DeviceVec<B::IcicleScalarField>,
-        aux_assignment: &DeviceVec<B::IcicleScalarField>,
+        msms: IndependentMsms<B::IcicleG1, B::IcicleG2>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let total_timer = std::time::Instant::now();
         let ProvingKey {
@@ -225,13 +393,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             a_query_first,
             b_g1_query_first,
             b_g2_query_first,
-            a_query_pub,
-            a_query_priv,
-            b_g1_query_pub,
-            b_g1_query_priv,
-            b_g2_query_pub,
-            b_g2_query_priv,
-            l_query,
             h_query,
             ..
         } = pkey;
@@ -248,67 +409,31 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let id = state.id();
 
-        let proof_streams = ProofStreams::new();
-        let stream_g1 = &proof_streams.g1;
-        let stream_g2 = &proof_streams.g2;
+        let IndependentMsms {
+            pub_acc_r_g1,
+            priv_acc_r_g1,
+            pub_acc_s_g1,
+            priv_acc_s_g1,
+            pub_acc_s_g2,
+            priv_acc_s_g2,
+            l_acc,
+        } = msms;
 
         let msm_timer = std::time::Instant::now();
-        // Compute A
-        let (pub_acc_r_g1, priv_acc_r_g1) = (
-            msm_async(
-                a_query_pub,
-                &input_assignment[1..],
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-            msm_async(
-                a_query_priv,
-                aux_assignment,
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-        );
+        let h_acc = PROOF_STREAMS.with(|streams| {
+            let streams = streams.borrow();
+            let stream_g1 = &streams.g1;
+            let stream_g2 = &streams.g2;
 
-        // Compute B in G1
-        let (pub_acc_s_g1, priv_acc_s_g1) = (
-            msm_async(
-                b_g1_query_pub,
-                &input_assignment[1..],
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-            msm_async(
-                b_g1_query_priv,
-                aux_assignment,
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-        );
+            // Compute msm(h_query, h) — the only MSM that had to wait for `h` to be ready. The
+            // other 7 were already dispatched (and are running concurrently with the GPU work
+            // above) by `dispatch_independent_msms`.
+            let h_acc = msm_async(h_query, &h, stream_g1, PRECOMPUTE_FACTOR_G1);
 
-        // Compute B in G2
-        let (pub_acc_s_g2, priv_acc_s_g2) = (
-            msm_async(
-                b_g2_query_pub,
-                &input_assignment[1..],
-                stream_g2,
-                PRECOMPUTE_FACTOR_G2,
-            ),
-            msm_async(
-                b_g2_query_priv,
-                aux_assignment,
-                stream_g2,
-                PRECOMPUTE_FACTOR_G2,
-            ),
-        );
-
-        // Compute msm(l_query, aux_assignment)
-        let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
-
-        // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, &h, stream_g1, PRECOMPUTE_FACTOR_G1);
-
-        stream_g1.synchronize().unwrap();
-        stream_g2.synchronize().unwrap();
+            stream_g1.synchronize().unwrap();
+            stream_g2.synchronize().unwrap();
+            h_acc
+        });
         tracing::info!(
             "MSM + stream sync took {} ms",
             msm_timer.elapsed().as_millis()

@@ -17,7 +17,7 @@ use std::{mem::transmute, ops::IndexMut};
 
 use crate::{
     bridges::{ArkIcicleBridge, ark_to_icicle_scalar, ark_to_icicle_scalars, icicle_to_ark_scalar},
-    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
+    gpu_utils::{fft_inplace, from_host_slice_async, ifft_inplace, to_host_vec_icicle_scalar},
 };
 
 use super::CircomGroth16Prover;
@@ -97,6 +97,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
+        stream: &IcicleStream,
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
@@ -107,8 +108,8 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         // SAFETY: At this point we know the shares are safe to transmute
         let shares = unsafe { transmute::<&[T::ArithmeticShare], &[B::ArkScalarField]>(shares) };
 
-        let shares_icicle = from_host_slice(shares);
-        ark_to_icicle_scalars(shares_icicle).unwrap()
+        let shares_icicle = from_host_slice_async(shares, stream);
+        ark_to_icicle_scalars(shares_icicle, stream).unwrap()
     }
 
     fn half_shares_to_device<
@@ -116,6 +117,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
+        stream: &IcicleStream,
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
@@ -127,8 +129,8 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         let shares =
             unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
 
-        let shares_icicle = from_host_slice(shares);
-        ark_to_icicle_scalars(shares_icicle).unwrap()
+        let shares_icicle = from_host_slice_async(shares, stream);
+        ark_to_icicle_scalars(shares_icicle, stream).unwrap()
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
@@ -144,6 +146,12 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         cfg.is_async = true;
 
         mul_scalars(a, b, result.as_mut_slice(), &cfg).unwrap();
+        // This synchronize is load-bearing, not redundant: `a`/`b` are read here on `stream`,
+        // but the caller (`reduction.rs`) immediately follows this call with in-place writes to
+        // the same buffers on *different* streams (`ifft_in_place` on `stream_a`/`stream_b`).
+        // Without blocking here, that write can be issued to the GPU before this read has
+        // actually completed — CUDA gives no ordering guarantee across streams — corrupting the
+        // input. See git history: `14f5ac7 fix: missing synchronization checkpoint`.
         stream
             .synchronize()
             .expect("Failed to synchronize local_mul_vec stream");

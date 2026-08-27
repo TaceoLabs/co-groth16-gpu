@@ -23,7 +23,7 @@ use crate::{
         ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar, ark_to_icicle_scalars,
         icicle_to_ark_scalar,
     },
-    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
+    gpu_utils::{fft_inplace, from_host_slice_async, ifft_inplace, to_host_vec_icicle_scalar},
 };
 use mpc_core::protocols::rep3::network::Rep3NetworkExt;
 
@@ -140,6 +140,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
+        stream: &IcicleStream,
     ) -> Self::DeviceShares {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -155,11 +156,11 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         let (shares_a, shares_b): (Vec<B::ArkScalarField>, Vec<B::ArkScalarField>) =
             shares.iter().map(|s| (s.a, s.b)).unzip();
 
-        let shares_a = from_host_slice(&shares_a);
-        let shares_b = from_host_slice(&shares_b);
+        let shares_a = from_host_slice_async(&shares_a, stream);
+        let shares_b = from_host_slice_async(&shares_b, stream);
 
-        let a = ark_to_icicle_scalars(shares_a).unwrap();
-        let b = ark_to_icicle_scalars(shares_b).unwrap();
+        let a = ark_to_icicle_scalars(shares_a, stream).unwrap();
+        let b = ark_to_icicle_scalars(shares_b, stream).unwrap();
 
         Self::DeviceShares { a, b }
     }
@@ -169,6 +170,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
+        stream: &IcicleStream,
     ) -> DeviceVec<F> {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -180,9 +182,9 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         let shares =
             unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
 
-        let shares = from_host_slice(shares);
+        let shares = from_host_slice_async(shares, stream);
 
-        ark_to_icicle_scalars(shares).unwrap()
+        ark_to_icicle_scalars(shares, stream).unwrap()
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
@@ -195,9 +197,9 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
             .rngs
             .rand
             .masking_field_elements_vec::<B::ArkScalarField>(a.a.len());
-        let masking_fes = from_host_slice(&masking_fes);
+        let masking_fes = from_host_slice_async(&masking_fes, stream);
         let masking_fes: DeviceVec<F> =
-            ark_to_icicle_scalars::<B::ArkScalarField, F>(masking_fes).unwrap();
+            ark_to_icicle_scalars::<B::ArkScalarField, F>(masking_fes, stream).unwrap();
 
         let mut tmp0 = DeviceVec::device_malloc_async(a.a.len(), stream)
             .expect("Failed to allocate device vector");
@@ -219,6 +221,12 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         add_scalars(&tmp0, &tmp1, result.as_mut_slice(), &cfg).unwrap();
         add_scalars(&tmp2, &result, tmp0.as_mut_slice(), &cfg).unwrap();
         add_scalars(&tmp0, &masking_fes, result.as_mut_slice(), &cfg).unwrap();
+        // This synchronize is load-bearing, not redundant: `a`/`b` are read here on `stream`,
+        // but the caller (`reduction.rs`) immediately follows this call with in-place writes to
+        // the same buffers on *different* streams (`ifft_in_place` on `stream_a`/`stream_b`).
+        // Without blocking here, that write can be issued to the GPU before this read has
+        // actually completed — CUDA gives no ordering guarantee across streams — corrupting the
+        // input. See git history: `14f5ac7 fix: missing synchronization checkpoint`.
         stream
             .synchronize()
             .expect("Failed to synchronize local_mul_vec stream");

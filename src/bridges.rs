@@ -51,7 +51,10 @@ where
     }
 }
 
-pub(crate) fn ark_to_icicle_scalars<T, I>(ark_scalars: DeviceVec<T>) -> eyre::Result<DeviceVec<I>>
+pub(crate) fn ark_to_icicle_scalars<T, I>(
+    ark_scalars: DeviceVec<T>,
+    stream: &IcicleStream,
+) -> eyre::Result<DeviceVec<I>>
 where
     T: PrimeField,
     I: FieldImpl + MontgomeryConvertible,
@@ -59,8 +62,12 @@ where
     // SAFETY: Reinterpreting Arkworks field elements as Icicle-specific scalars
     let mut icicle_scalars = unsafe { transmute::<DeviceVec<T>, DeviceVec<I>>(ark_scalars) };
 
-    // Convert from Montgomery representation using the Icicle type's conversion method
-    I::from_mont(&mut icicle_scalars, &IcicleStream::default());
+    // Convert from Montgomery representation using the Icicle type's conversion method. Runs on
+    // the caller's stream rather than the CUDA default/null stream: under legacy stream
+    // semantics, ops on the null stream implicitly synchronize the whole device against every
+    // other in-flight stream, which would silently serialize this against unrelated concurrent
+    // work.
+    I::from_mont(&mut icicle_scalars, stream);
 
     Ok(icicle_scalars)
 }
