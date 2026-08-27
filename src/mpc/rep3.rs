@@ -18,6 +18,7 @@ use mpc_core::{
     },
 };
 use mpc_net::Network;
+use rayon::prelude::*;
 
 use crate::{
     bridges::{
@@ -298,16 +299,19 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
         let host_a = to_host_vec_icicle_scalar(&shares.a)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
             .collect::<Vec<_>>();
         let host_b = to_host_vec_icicle_scalar(&shares.b)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
             .collect::<Vec<_>>();
 
         let shares = host_a
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .zip(host_b)
             .map(|(a, b)| Rep3PrimeFieldShare { a, b })
             .collect::<Vec<_>>();
@@ -322,16 +326,19 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
         let host_a = to_host_vec_icicle_scalar(shares)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar::<B::ArkScalarField, _>)
             .collect::<Vec<_>>();
 
         let (b, c) = net.broadcast_many(&host_a)?;
 
         Ok(host_a
-            .into_iter()
-            .zip(b.into_iter().zip(c))
-            .map(|(a, (b, c))| a + b + c)
+            .into_par_iter()
+            .with_min_len(1024)
+            .zip(b)
+            .zip(c)
+            .map(|((a, b), c)| a + b + c)
             .collect::<Vec<_>>())
     }
 }

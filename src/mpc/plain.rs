@@ -12,6 +12,7 @@ use icicle_runtime::{
 use mpc_core::MpcState;
 use mpc_net::Network;
 use rand::thread_rng;
+use rayon::prelude::*;
 use std::{mem::transmute, ops::IndexMut};
 
 use crate::{
@@ -200,7 +201,8 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
         Ok(to_host_vec_icicle_scalar(shares)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar)
             .collect::<Vec<_>>())
     }
@@ -211,7 +213,8 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         _: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>> {
         Ok(to_host_vec_icicle_scalar(shares)
-            .into_iter()
+            .into_par_iter()
+            .with_min_len(1024)
             .map(icicle_to_ark_scalar)
             .collect::<Vec<_>>())
     }
