@@ -140,10 +140,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     /// This version takes the Circom-generated constraint matrices as input and does not re-calculate them.
     #[expect(clippy::too_many_arguments)]
     fn prove_inner<N: Network, R: R1CSToQAP>(
-        net0: &N,
-        net1: &N,
-        state0: &mut T::State,
-        state1: &mut T::State,
+        net: &N,
+        state: &mut T::State,
         eval_a: &mut T::DeviceShares,
         eval_b: &mut T::DeviceShares,
         eval_c: Option<&mut DeviceVec<B::IcicleScalarField>>,
@@ -153,7 +151,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let timer_start = std::time::Instant::now();
         let h = R::witness_map_from_r1cs_eval::<B, T>(
-            state0,
+            state,
             eval_a,
             eval_b,
             eval_c,
@@ -167,18 +165,13 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             timer_start.elapsed().as_millis()
         );
 
-        let (r, s) = (
-            T::rand::<_, B>(net0, state0)?,
-            T::rand::<_, B>(net0, state0)?,
-        );
+        let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
 
         let private_witness_half_shares = T::to_half_share_vec(private_witness);
 
         Self::create_proof_with_assignment(
-            net0,
-            net1,
-            state0,
-            state1,
+            net,
+            state,
             pkey,
             r,
             s,
@@ -208,10 +201,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
     #[expect(clippy::too_many_arguments)]
     fn create_proof_with_assignment<N: Network>(
-        net0: &N,
-        net1: &N,
-        state0: &mut T::State,
-        state1: &mut T::State,
+        net: &N,
+        state: &mut T::State,
         pkey: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
         r: T::ArithmeticShare,
         s: T::ArithmeticShare,
@@ -248,7 +239,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let delta_g1 = delta_g1.to_projective();
         let delta_g2 = delta_g2.to_projective();
 
-        let id = state0.id();
+        let id = state.id();
 
         let proof_streams = ProofStreams::new();
         let stream_g1 = &proof_streams.g1;
@@ -360,7 +351,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         );
 
         // Compute r * s
-        let rs = T::local_mul::<B>(&r, &s, state0);
+        let rs = T::local_mul::<B>(&r, &s, state);
         let r_s_delta_g1 = delta_g1 * rs;
         tracing::info!(
             "Coefficient assembly took {} ms",
@@ -371,27 +362,25 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let g_a = r_g1;
         let g1_b = s_g1;
 
-        let (g_a_opened, r_g1_b) = rayon::join(
-            || T::open_half_point_g1::<_, B>(g_a, net0, state0).expect("Failed to open g_a"),
-            || {
-                T::scalar_mul_g1::<_, B>(&g1_b, r, net1, state1)
-                    .expect("Failed to scalar mul g1_b with r")
-            },
-        );
+        // Opening g1_b = B*G1 is safe: B is masked by the fresh uniform s, and its exponent is
+        // published in the proof as b = B*G2 anyway. With B*G1 public, r*B*G1 is a local
+        // scalar multiplication, so both values can be opened in a single round.
+        let (g_a_opened, g1_b_opened) = T::open_two_half_points_g1::<_, B>(g_a, g1_b, net, state)
+            .expect("Failed to open g_a and g1_b");
+        let r_g1_b: Projective<<B as ArkIcicleBridge>::IcicleG1> =
+            g1_b_opened.to_projective() * r_hs;
 
         let s_g_a: Projective<<B as ArkIcicleBridge>::IcicleG1> = g_a_opened.to_projective() * s_hs;
 
         let mut g_c = s_g_a;
-        g_c = g_c + r_g1_b.to_projective();
+        g_c = g_c + r_g1_b;
         g_c = g_c - r_s_delta_g1;
         g_c = g_c + l_acc;
         g_c = g_c + h_acc;
 
         let g2_b = s_g2;
-        let (g_c_opened, g2_b_opened) = rayon::join(
-            || T::open_half_point_g1::<_, B>(g_c.into(), net0, state0),
-            || T::open_half_point_g2::<_, B>(g2_b, net1, state1),
-        );
+        let (g_c_opened, g2_b_opened) =
+            T::open_two_half_points_g1g2::<_, B>(g_c.into(), g2_b, net, state)?;
         tracing::info!(
             "Point openings took {} ms",
             open_timer.elapsed().as_millis()
@@ -403,8 +392,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         Ok(Proof {
             a: g_a_opened,
-            b: g2_b_opened?,
-            c: g_c_opened?,
+            b: g2_b_opened,
+            c: g_c_opened,
         })
     }
 }
@@ -521,8 +510,6 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
             let icicle_proof =
                 CoGroth16Icicle::<Bn254Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
                     &(),
-                    &(),
-                    &mut (),
                     &mut (),
                     &mut eval_a,
                     &mut eval_b,
@@ -574,8 +561,6 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
             let icicle_proof =
                 CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
                     &(),
-                    &(),
-                    &mut (),
                     &mut (),
                     &mut eval_a,
                     &mut eval_b,
@@ -602,8 +587,7 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
 
 impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
     pub fn prove<N: Network, R: R1CSToQAP>(
-        net0: &N,
-        net1: &N,
+        net: &N,
         pkey: &ark_groth16::ProvingKey<P>,
         prepared_bn254_key: Option<Arc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
@@ -619,9 +603,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
         .ok_or(eyre::eyre!("Polynomial Degree too large"))?;
         let domain_size = domain.size();
 
-        // we need 3 number of corr rand pairs. 2 for two rand calls, 1 for scalar_mul
-        let mut state0 = Rep3State::new(net0, A2BType::default())?;
-        let mut state1 = state0.fork(0)?;
+        let mut state = Rep3State::new(net, A2BType::default())?;
 
         if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() {
             let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
@@ -641,7 +623,7 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
                     co_groth16::mpc::Rep3Groth16Driver,
                     R,
                 >(
-                    state0.id(),
+                    state.id(),
                     matrices,
                     private_witness,
                     public_inputs,
@@ -657,10 +639,8 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
             });
             let icicle_proof =
                 CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::prove_inner::<N, R>(
-                    net0,
-                    net1,
-                    &mut state0,
-                    &mut state1,
+                    net,
+                    &mut state,
                     &mut eval_a,
                     &mut eval_b,
                     eval_c.as_mut(),
