@@ -6,12 +6,13 @@ use ark_bn254::Bn254;
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
-use eyre::Result;
+use eyre::{Context, Result};
 use icicle_core::curve::{Affine, Curve, Projective};
 use icicle_runtime::memory::DeviceVec;
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
+use mpc_core::protocols::shamir::{ShamirPreprocessing, ShamirPrimeFieldShare, ShamirState};
 use mpc_net::Network;
 use std::sync::Arc;
 use std::{marker::PhantomData, mem::transmute};
@@ -23,6 +24,7 @@ use crate::gpu_utils::{Proof, ProofStreams, ProvingKey, VerifyingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
+use crate::mpc::shamir::ShamirGroth16Driver;
 
 pub use reduction::{CircomReduction, LibSnarkReduction, R1CSToQAP};
 mod reduction;
@@ -43,6 +45,11 @@ pub struct Groth16<P> {
 
 /// A type alias for a [CoGroth16] protocol using replicated secret sharing, using the Circom R1CSToQAPReduction by default.
 pub struct Rep3CoGroth16<P> {
+    phantom_data: PhantomData<P>,
+}
+
+/// A type alias for a [CoGroth16] protocol using Shamir secret sharing, using the Circom R1CSToQAPReduction by default.
+pub struct ShamirCoGroth16<P> {
     phantom_data: PhantomData<P>,
 }
 
@@ -639,6 +646,129 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
             });
             let icicle_proof =
                 CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::prove_inner::<N, R>(
+                    net,
+                    &mut state,
+                    &mut eval_a,
+                    &mut eval_b,
+                    eval_c.as_mut(),
+                    &prepared_key,
+                    private_witness,
+                    &public_inputs,
+                )?;
+
+            let proof = icicle_proof.to_ark::<Bn254Bridge>();
+
+            let proof = unsafe {
+                transmute::<&ark_groth16::Proof<ark_bn254::Bn254>, &ark_groth16::Proof<P>>(&proof)
+            };
+
+            Ok(proof.clone())
+        } else {
+            panic!("Unsupported pairing")
+        }
+    }
+
+    /// Create a [`ark_groth16::Proof`] by locally translating the REP3 `witness` into a 3-party
+    /// Shamir sharing (no communication) and running [`ShamirCoGroth16::prove`], giving the same
+    /// trust assumption as [`Self::prove`] with a cheaper online phase.
+    ///
+    /// # Errors
+    /// Returns an error if `net.id()` is not a valid REP3 party id (0, 1, or 2).
+    pub fn prove_with_shamir_bridge<N: Network, R: R1CSToQAP>(
+        net: &N,
+        pkey: &ark_groth16::ProvingKey<P>,
+        prepared_bn254_key: Option<Arc<Bn254PreparedKey>>,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+        witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
+    ) -> Result<ark_groth16::Proof<P>> {
+        let translated_witness = ShamirState::translate_primefield_repshare_vec(
+            witness.witness,
+            net.id().try_into().context("not a valid party id")?,
+        );
+        ShamirCoGroth16::<P>::prove::<N, R>(
+            net,
+            3, // number of parties is 3 for REP3
+            1, // threshold is 1 for REP3
+            pkey,
+            prepared_bn254_key,
+            matrices,
+            SharedWitness {
+                public_inputs: witness.public_inputs,
+                witness: translated_witness,
+            },
+        )
+    }
+}
+
+impl<P: ark_ec::pairing::Pairing> ShamirCoGroth16<P> {
+    /// Create a proof by running the collaborative Groth16 prover under Shamir secret sharing,
+    /// secure against `threshold` semi-honest corruptions among `num_parties` parties.
+    /// `num_parties` must be at least `2 * threshold + 1`, since `g_c` is opened as a
+    /// degree-`2*threshold` sharing.
+    ///
+    /// Correlated randomness is preprocessed over `net` before the online phase.
+    #[expect(clippy::too_many_arguments)]
+    pub fn prove<N: Network, R: R1CSToQAP>(
+        net: &N,
+        num_parties: usize,
+        threshold: usize,
+        pkey: &ark_groth16::ProvingKey<P>,
+        prepared_bn254_key: Option<Arc<Bn254PreparedKey>>,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+        private_witness: SharedWitness<P::ScalarField, ShamirPrimeFieldShare<P::ScalarField>>,
+    ) -> Result<ark_groth16::Proof<P>> {
+        let public_inputs = &private_witness.public_inputs;
+        let private_witness = &private_witness.witness;
+
+        // TODO CESAR: Duplicate
+        let domain = GeneralEvaluationDomain::<P::ScalarField>::new(
+            matrices.num_constraints + matrices.num_instance_variables,
+        )
+        .ok_or(eyre::eyre!("Polynomial Degree too large"))?;
+        let domain_size = domain.size();
+
+        if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() {
+            let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
+                src_pairing = P,
+                dst_pairing = ark_bn254::Bn254,
+                dst_field = ark_bn254::Fr,
+                src_arithmetic_share = ShamirPrimeFieldShare<P::ScalarField>,
+                dst_arithmetic_share = ShamirPrimeFieldShare<ark_bn254::Fr>,
+                pkey,
+                matrices,
+                private_witness,
+                public_inputs
+            );
+
+            // we need 2 corr rand pairs for the two rand calls
+            let num_pairs = 2;
+            let preprocessing = ShamirPreprocessing::new(num_parties, threshold, num_pairs, net)?;
+            let mut state = ShamirState::from(preprocessing);
+
+            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
+                CoGroth16Icicle::<Bn254Bridge, ShamirGroth16Driver<ark_bn254::Fr>>::setup::<
+                    co_groth16::mpc::ShamirGroth16Driver,
+                    R,
+                >(
+                    state.id(),
+                    matrices,
+                    private_witness,
+                    public_inputs,
+                    domain_size,
+                )?;
+
+            let prepared_key = prepared_bn254_key.unwrap_or_else(|| {
+                Arc::new(prepare_bn254_key::<R>(
+                    key,
+                    matrices.num_constraints,
+                    matrices.num_instance_variables,
+                ))
+            });
+            let icicle_proof =
+                CoGroth16Icicle::<Bn254Bridge, ShamirGroth16Driver<ark_bn254::Fr>>::prove_inner::<
+                    N,
+                    R,
+                >(
                     net,
                     &mut state,
                     &mut eval_a,

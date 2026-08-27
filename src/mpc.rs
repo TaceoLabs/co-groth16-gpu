@@ -1,6 +1,6 @@
 pub(crate) mod plain;
 pub(crate) mod rep3;
-// pub(crate) mod shamir;
+pub(crate) mod shamir;
 
 use std::mem::transmute;
 
@@ -25,7 +25,7 @@ use crate::{
 
 pub use plain::PlainGroth16Driver;
 pub use rep3::Rep3Groth16Driver;
-// pub use shamir::ShamirGroth16Driver;
+pub use shamir::ShamirGroth16Driver;
 
 /// This trait represents the operations used during Groth16 proof generation
 pub trait CircomGroth16Prover<

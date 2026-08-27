@@ -10,7 +10,7 @@ use icicle_runtime::runtime;
 
 pub use groth16_gpu::{
     Bn254PreparedKey, CircomReduction, Groth16, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16,
-    prepare_bn254_key,
+    ShamirCoGroth16, prepare_bn254_key,
 };
 
 pub fn load_backend_from_env_and_set_device(device_idx: i32) {
@@ -48,7 +48,7 @@ mod tests {
 
     use crate::groth16_gpu::{Bn254PreparedKey, prepare_bn254_key};
     use crate::{
-        CircomReduction, LibSnarkReduction, Rep3CoGroth16, groth16_gpu::Groth16,
+        CircomReduction, LibSnarkReduction, Rep3CoGroth16, ShamirCoGroth16, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
     };
 
@@ -356,6 +356,122 @@ mod tests {
 
                         let gpu_prove = |pkey, prepared_key, matrices, witness| {
                             dummy_prove::<Bn254>(&net, pkey, prepared_key, matrices, witness)
+                        };
+
+                        run_provers!(
+                            cpu_prove = cpu_prove,
+                            gpu_prove = gpu_prove,
+                            pkey = &zkey.1,
+                            prepared_key = None, // only the first party prepares the key to avoid redundant work
+                            matrices = &zkey.0,
+                            witness = x,
+                            silent = true
+                        );
+                    }
+                }));
+            }
+
+            threads.into_iter().for_each(|t| {
+                t.join().unwrap();
+            });
+        }
+    }
+
+    #[test]
+    //#[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
+    fn create_proof_transaction_batched_bn254_shamir() {
+        const NUM_PARTIES: usize = 3;
+        const THRESHOLD: usize = 1;
+
+        for check in [CheckElement::Yes, CheckElement::No] {
+            let zkey_file =
+                File::open("test_vectors/Groth16/bn254/transaction_batched/circuit.zkey").unwrap();
+            let witness_file =
+                File::open("test_vectors/Groth16/bn254/transaction_batched/witness.bin").unwrap();
+            let mut reader = BufReader::new(witness_file);
+
+            let witness = Vec::<ark_bn254::Fr>::deserialize_uncompressed(&mut reader).unwrap();
+
+            let zkey = Zkey::<Bn254>::from_reader(zkey_file, check).unwrap();
+
+            let witness = Witness::<ark_bn254::Fr> { values: witness };
+
+            let zkey: (ConstraintMatrices<_>, ProvingKey<_>) = zkey.into();
+            let zkey1 = Arc::new(zkey);
+            let zkey2 = Arc::clone(&zkey1);
+            let zkey3 = Arc::clone(&zkey1);
+
+            let mut rng = rand::thread_rng();
+            let witness_shares = SharedWitness::share_shamir(
+                witness,
+                zkey1.0.num_instance_variables,
+                THRESHOLD,
+                NUM_PARTIES,
+                &mut rng,
+            );
+
+            let nets = LocalNetwork::new(NUM_PARTIES);
+
+            let mut threads = vec![];
+            for (net, x, zkey) in izip!(
+                nets,
+                witness_shares.into_iter(),
+                [zkey1, zkey2, zkey3].into_iter()
+            ) {
+                threads.push(std::thread::spawn(move || {
+                    // Only party 0 has a GPU/icicle-backed prover to compare against; parties 1
+                    // and 2 always run the real CPU Shamir co-party protocol so preprocessing
+                    // and the degree-reduction networking stay in lockstep with party 0.
+                    let cpu_prove = |pkey, matrices, witness| {
+                        co_groth16::ShamirCoGroth16::<Bn254>::prove::<
+                            LocalNetwork,
+                            co_groth16::CircomReduction,
+                        >(
+                            &net, NUM_PARTIES, THRESHOLD, pkey, matrices, witness
+                        )
+                    };
+
+                    if net.id() == 0 {
+                        load_backend_from_env_and_set_device(0);
+
+                        let gpu_prove = |pkey, prepared_key, matrices, witness| {
+                            ShamirCoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
+                                &net,
+                                NUM_PARTIES,
+                                THRESHOLD,
+                                pkey,
+                                prepared_key,
+                                matrices,
+                                witness,
+                            )
+                        };
+
+                        let prepared_key = prepare_bn254_key::<CircomReduction>(
+                            &zkey.1,
+                            zkey.0.num_constraints,
+                            zkey.0.num_instance_variables,
+                        );
+
+                        run_provers!(
+                            cpu_prove = cpu_prove,
+                            gpu_prove = gpu_prove,
+                            pkey = &zkey.1,
+                            prepared_key = Some(Arc::new(prepared_key)),
+                            matrices = &zkey.0,
+                            witness = x,
+                            silent = false // only print for the first party to avoid cluttering the output
+                        );
+                    } else {
+                        let gpu_prove = |pkey,
+                                         _prepared_key: Option<Arc<Bn254PreparedKey>>,
+                                         matrices,
+                                         witness| {
+                            co_groth16::ShamirCoGroth16::<Bn254>::prove::<
+                                LocalNetwork,
+                                co_groth16::CircomReduction,
+                            >(
+                                &net, NUM_PARTIES, THRESHOLD, pkey, matrices, witness
+                            )
                         };
 
                         run_provers!(
