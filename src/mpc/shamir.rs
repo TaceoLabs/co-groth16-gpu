@@ -42,17 +42,23 @@ pub struct ShamirGroth16Driver<Fr>(PhantomData<Fr>);
 ///
 /// This is only sound when `Fr` and `ArkF` are the same type, which callers must
 /// guarantee by only ever using a bridge `B` whose `B::ArkScalarField` matches the
-/// driver's `Fr`.
+/// driver's `Fr`. Verified at runtime via a safe `Any` downcast rather than an
+/// unchecked transmute.
+///
+/// TODO: this whole cast (and the `Fr` type parameter on `ShamirGroth16Driver`) can
+/// be removed if `CircomGroth16Prover` is redefined to be generic over a single
+/// `B: ArkIcicleBridge` per impl (instead of each method separately taking its own
+/// `B: ArkIcicleBridge<IcicleScalarField = F>`). Then `ShamirGroth16Driver<B>` could
+/// declare `type State = ShamirState<B::ArkScalarField>` directly, and the
+/// driver/bridge pairing would be enforced by the type system instead of by callers
+/// consistently picking a matching `Fr`. That requires updating the trait in
+/// `mpc.rs`, all three driver impls, and the call sites in `groth16_gpu.rs`.
 fn cast_state<Fr: PrimeField + 'static, ArkF: PrimeField + 'static>(
     state: &mut ShamirState<Fr>,
 ) -> &mut ShamirState<ArkF> {
-    assert_eq!(
-        std::any::TypeId::of::<Fr>(),
-        std::any::TypeId::of::<ArkF>(),
-        "Invalid bridge: ArkScalarField does not match driver's scalar field"
-    );
-    // SAFETY: checked above that Fr and ArkF are the same type
-    unsafe { transmute::<&mut ShamirState<Fr>, &mut ShamirState<ArkF>>(state) }
+    (state as &mut dyn std::any::Any)
+        .downcast_mut::<ShamirState<ArkF>>()
+        .expect("Invalid bridge: ArkScalarField does not match driver's scalar field")
 }
 
 impl<F, Fr> CircomGroth16Prover<F> for ShamirGroth16Driver<Fr>
