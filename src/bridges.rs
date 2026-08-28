@@ -1,6 +1,5 @@
 use std::mem::transmute;
 
-use ark_bls12_377::Bls12_377;
 use ark_bn254::Bn254;
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{BigInteger, PrimeField};
@@ -141,34 +140,37 @@ impl ArkIcicleBridge for Bn254Bridge {
     }
 }
 
-pub(crate) struct Bls12_377Bridge;
+// bls12_377/LibSnarkReduction support removed: not needed for our case atm,
+// and its h_query/domain_size length mismatch with LibSnarkReduction was
+// causing problems.
+// pub(crate) struct Bls12_377Bridge;
 
-impl ArkIcicleBridge for Bls12_377Bridge {
-    type ArkScalarField = ark_bls12_377::Fr;
-    type ArkG1Affine = <Bls12_377 as ark_ec::pairing::Pairing>::G1Affine;
-    type ArkG2Affine = <Bls12_377 as ark_ec::pairing::Pairing>::G2Affine;
-    type ArkG1 = <Bls12_377 as ark_ec::pairing::Pairing>::G1;
-    type ArkG2 = <Bls12_377 as ark_ec::pairing::Pairing>::G2;
-    type ArkPairing = Bls12_377;
+// impl ArkIcicleBridge for Bls12_377Bridge {
+//     type ArkScalarField = ark_bls12_377::Fr;
+//     type ArkG1Affine = <Bls12_377 as ark_ec::pairing::Pairing>::G1Affine;
+//     type ArkG2Affine = <Bls12_377 as ark_ec::pairing::Pairing>::G2Affine;
+//     type ArkG1 = <Bls12_377 as ark_ec::pairing::Pairing>::G1;
+//     type ArkG2 = <Bls12_377 as ark_ec::pairing::Pairing>::G2;
+//     type ArkPairing = Bls12_377;
 
-    type IcicleScalarCfg = icicle_bls12_377::curve::ScalarCfg;
-    type IcicleScalarField = icicle_bls12_377::curve::ScalarField;
-    type IcicleG1 = icicle_bls12_377::curve::CurveCfg;
-    type IcicleG2 = icicle_bls12_377::curve::G2CurveCfg;
+//     type IcicleScalarCfg = icicle_bls12_377::curve::ScalarCfg;
+//     type IcicleScalarField = icicle_bls12_377::curve::ScalarField;
+//     type IcicleG1 = icicle_bls12_377::curve::CurveCfg;
+//     type IcicleG2 = icicle_bls12_377::curve::G2CurveCfg;
 
-    fn icicle_to_ark_g1(point: icicle_bls12_377::curve::G1Affine) -> Self::ArkG1Affine {
-        if point == icicle_bls12_377::curve::G1Affine::zero() {
-            return Self::ArkG1Affine::zero();
-        }
+//     fn icicle_to_ark_g1(point: icicle_bls12_377::curve::G1Affine) -> Self::ArkG1Affine {
+//         if point == icicle_bls12_377::curve::G1Affine::zero() {
+//             return Self::ArkG1Affine::zero();
+//         }
 
-        Self::ArkG1Affine::new(icicle_to_ark_base(&point.x), icicle_to_ark_base(&point.y))
-    }
+//         Self::ArkG1Affine::new(icicle_to_ark_base(&point.x), icicle_to_ark_base(&point.y))
+//     }
 
-    fn icicle_to_ark_g2(point: icicle_bls12_377::curve::G2Affine) -> Self::ArkG2Affine {
-        if point == icicle_bls12_377::curve::G2Affine::zero() {
-            return Self::ArkG2Affine::zero();
-        }
+//     fn icicle_to_ark_g2(point: icicle_bls12_377::curve::G2Affine) -> Self::ArkG2Affine {
+//         if point == icicle_bls12_377::curve::G2Affine::zero() {
+//             return Self::ArkG2Affine::zero();
+//         }
 
-        Self::ArkG2Affine::new(icicle_to_ark_base(&point.x), icicle_to_ark_base(&point.y))
-    }
-}
+//         Self::ArkG2Affine::new(icicle_to_ark_base(&point.x), icicle_to_ark_base(&point.y))
+//     }
+// }

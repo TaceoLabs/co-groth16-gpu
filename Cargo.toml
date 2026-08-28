@@ -12,7 +12,6 @@ readme = "./README.md"
 
 [dependencies]
 ark-bn254 = "0.6"
-ark-bls12-377 = "0.6"
 ark-ec = { version = "0.6", default-features = false }
 ark-ff = { version = "0.6", features = ["asm"] }
 ark-groth16 = "0.6"
@@ -25,7 +24,6 @@ eyre = "0.6"
 icicle-core = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
 icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
 icicle-bn254 = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
-icicle-bls12-377 = { git = "https://github.com/ingonyama-zk/icicle-snark.git" }
 mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", rev = "b95c341ca5bf3b56fb0ea99fff7b31621a9ae197" }
 mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", rev = "b95c341ca5bf3b56fb0ea99fff7b31621a9ae197", features = [
     "local",

@@ -24,11 +24,10 @@ pub fn load_backend_from_env_and_set_device(device_idx: i32) {
 #[cfg(test)]
 mod tests {
 
-    use ark_bls12_377::Bls12_377;
+    // use ark_bls12_377::Bls12_377;
     use ark_bn254::Bn254;
 
     use ark_ff::UniformRand;
-    use ark_relations::utils::matrix::Matrix;
     use ark_serialize::CanonicalDeserialize;
     use circom_types::{CheckElement, Witness, groth16::Zkey};
     use co_circom_types::SharedWitness;
@@ -48,7 +47,7 @@ mod tests {
 
     use crate::groth16_gpu::{Bn254PreparedKey, prepare_bn254_key};
     use crate::{
-        CircomReduction, LibSnarkReduction, Rep3CoGroth16, ShamirCoGroth16, groth16_gpu::Groth16,
+        CircomReduction, Rep3CoGroth16, ShamirCoGroth16, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
     };
 
@@ -559,68 +558,71 @@ mod tests {
         }
     }
 
-    fn proof_libsnark_penumbra_bls12_377(circuit: &str) {
-        load_backend_from_env_and_set_device(0);
+    // bls12_377/LibSnarkReduction support removed: not needed for our case atm,
+    // and its h_query/domain_size length mismatch with LibSnarkReduction was
+    // causing problems.
+    // fn proof_libsnark_penumbra_bls12_377(circuit: &str) {
+    //     load_backend_from_env_and_set_device(0);
 
-        let pkey_file = File::open(format!(
-            "test_vectors/Groth16/bls12_377/{circuit}/circuit.pk"
-        ))
-        .unwrap();
-        let a_file = File::open(format!("test_vectors/Groth16/bls12_377/{circuit}/a.bin")).unwrap();
-        let b_file = File::open(format!("test_vectors/Groth16/bls12_377/{circuit}/b.bin")).unwrap();
-        let c_file = File::open(format!("test_vectors/Groth16/bls12_377/{circuit}/c.bin")).unwrap();
-        let witness_file = File::open(format!(
-            "test_vectors/Groth16/bls12_377/{circuit}/witness.wtns"
-        ))
-        .unwrap();
+    //     let pkey_file = File::open(format!(
+    //         "test_vectors/Groth16/bls12_377/{circuit}/circuit.pk"
+    //     ))
+    //     .unwrap();
+    //     let a_file = File::open(format!("test_vectors/Groth16/bls12_377/{circuit}/a.bin")).unwrap();
+    //     let b_file = File::open(format!("test_vectors/Groth16/bls12_377/{circuit}/b.bin")).unwrap();
+    //     let c_file = File::open(format!("test_vectors/Groth16/bls12_377/{circuit}/c.bin")).unwrap();
+    //     let witness_file = File::open(format!(
+    //         "test_vectors/Groth16/bls12_377/{circuit}/witness.wtns"
+    //     ))
+    //     .unwrap();
 
-        let witness = Witness::<ark_bls12_377::Fr>::from_reader(witness_file).unwrap();
-        let pkey = ProvingKey::<Bls12_377>::deserialize_uncompressed_unchecked(pkey_file).unwrap();
-        // TODO once we can serde ConstraintMatrices, we dont need to do this anymore
-        let a = Matrix::<ark_bls12_377::Fr>::deserialize_uncompressed(a_file).unwrap();
-        let b = Matrix::<ark_bls12_377::Fr>::deserialize_uncompressed(b_file).unwrap();
-        let c = Matrix::<ark_bls12_377::Fr>::deserialize_uncompressed(c_file).unwrap();
-        let matrices = ConstraintMatrices {
-            num_instance_variables: pkey.b_g1_query.len() - pkey.l_query.len(),
-            num_witness_variables: pkey.a_query.len() - pkey.b_g1_query.len() + pkey.l_query.len(),
-            num_constraints: a.len(),
-            a_num_non_zero: a.len(),
-            b_num_non_zero: b.len(),
-            c_num_non_zero: c.len(),
-            a,
-            b,
-            c,
-        };
+    //     let witness = Witness::<ark_bls12_377::Fr>::from_reader(witness_file).unwrap();
+    //     let pkey = ProvingKey::<Bls12_377>::deserialize_uncompressed_unchecked(pkey_file).unwrap();
+    //     // TODO once we can serde ConstraintMatrices, we dont need to do this anymore
+    //     let a = Matrix::<ark_bls12_377::Fr>::deserialize_uncompressed(a_file).unwrap();
+    //     let b = Matrix::<ark_bls12_377::Fr>::deserialize_uncompressed(b_file).unwrap();
+    //     let c = Matrix::<ark_bls12_377::Fr>::deserialize_uncompressed(c_file).unwrap();
+    //     let matrices = ConstraintMatrices {
+    //         num_instance_variables: pkey.b_g1_query.len() - pkey.l_query.len(),
+    //         num_witness_variables: pkey.a_query.len() - pkey.b_g1_query.len() + pkey.l_query.len(),
+    //         num_constraints: a.len(),
+    //         a_num_non_zero: a.len(),
+    //         b_num_non_zero: b.len(),
+    //         c_num_non_zero: c.len(),
+    //         a,
+    //         b,
+    //         c,
+    //     };
 
-        let public_input = witness.values[..matrices.num_instance_variables].to_vec();
-        let witness = SharedWitness {
-            public_inputs: public_input.clone(),
-            witness: witness.values[matrices.num_instance_variables..].to_vec(),
-        };
-        run_provers!(
-            cpu_prove =
-                co_groth16::Groth16::<Bls12_377>::plain_prove::<co_groth16::LibSnarkReduction>,
-            gpu_prove = Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>,
-            pkey = &pkey,
-            prepared_key = None,
-            matrices = &matrices,
-            witness = witness,
-            silent = false
-        );
-    }
+    //     let public_input = witness.values[..matrices.num_instance_variables].to_vec();
+    //     let witness = SharedWitness {
+    //         public_inputs: public_input.clone(),
+    //         witness: witness.values[matrices.num_instance_variables..].to_vec(),
+    //     };
+    //     run_provers!(
+    //         cpu_prove =
+    //             co_groth16::Groth16::<Bls12_377>::plain_prove::<co_groth16::LibSnarkReduction>,
+    //         gpu_prove = Groth16::<Bls12_377>::plain_prove::<LibSnarkReduction>,
+    //         pkey = &pkey,
+    //         prepared_key = None,
+    //         matrices = &matrices,
+    //         witness = witness,
+    //         silent = false
+    //     );
+    // }
 
-    #[test]
-    fn proof_libsnark_penumbra_spend_bls12_377() {
-        proof_libsnark_penumbra_bls12_377("penumbra_spend");
-    }
+    // #[test]
+    // fn proof_libsnark_penumbra_spend_bls12_377() {
+    //     proof_libsnark_penumbra_bls12_377("penumbra_spend");
+    // }
 
-    #[test]
-    fn proof_libsnark_penumbra_output_bls12_377() {
-        proof_libsnark_penumbra_bls12_377("penumbra_output");
-    }
+    // #[test]
+    // fn proof_libsnark_penumbra_output_bls12_377() {
+    //     proof_libsnark_penumbra_bls12_377("penumbra_output");
+    // }
 
-    #[test]
-    fn proof_libsnark_penumbra_delegator_vote_bls12_377() {
-        proof_libsnark_penumbra_bls12_377("penumbra_delegator_vote");
-    }
+    // #[test]
+    // fn proof_libsnark_penumbra_delegator_vote_bls12_377() {
+    //     proof_libsnark_penumbra_bls12_377("penumbra_delegator_vote");
+    // }
 }
