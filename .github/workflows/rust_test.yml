@@ -1,0 +1,130 @@
+name: Rust Tests
+
+on:
+  push:
+    branches:
+      - main
+    tags-ignore:
+      - v*
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # incremental builds are slower and don't make much sense in ci
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: FULL
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: gpu-runner
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Install build dependencies
+        run: |
+          set -eux
+          pkgs="lld cmake clang pkg-config libc++-dev"
+          missing=""
+          for pkg in $pkgs; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+          done
+          if [ -n "$missing" ]; then
+            sudo apt-get update
+            sudo apt-get install -y $missing
+          fi
+      # The icicle CUDA backend needs nvcc; install it if this runner doesn't
+      # already have it. NVIDIA's per-Ubuntu-release repo only carries the
+      # cuda-toolkit-<major>-<minor> versions released around that Ubuntu
+      # version, so pick whatever version the repo actually offers instead
+      # of pinning one (a fixed pin like 12-8 doesn't exist on newer repos).
+      - name: Install CUDA toolkit
+        run: |
+          set -eux
+          if ! command -v nvcc >/dev/null; then
+            . /etc/os-release
+            distro="ubuntu${VERSION_ID//./}"
+            curl -fsSL -o /tmp/cuda-keyring.deb \
+              "https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
+            sudo dpkg -i /tmp/cuda-keyring.deb
+            rm /tmp/cuda-keyring.deb
+            sudo apt-get update
+            pkg=$(apt-cache pkgnames cuda-toolkit- | grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' | sort -V | tail -1)
+            if [ -z "$pkg" ]; then
+              echo "no cuda-toolkit-<major>-<minor> package available in the NVIDIA repo for $distro" >&2
+              exit 1
+            fi
+            sudo apt-get install -y "$pkg"
+          fi
+          cuda_bin=$(compgen -G "/usr/local/cuda-*/bin" | sort -V | tail -1)
+          echo "$cuda_bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=${cuda_bin%/bin}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+      # Non-fatal: just makes GPU visibility (or its absence) obvious in the
+      # log up front, instead of only showing up later as an opaque
+      # InvalidDevice panic from icicle_runtime::set_device deep in the test
+      # step.
+      - name: GPU diagnostics
+        run: nvidia-smi || echo "nvidia-smi failed or found no GPU"
+      # Cargo.lock is gitignored, so it doesn't exist after checkout; generate
+      # it here so both rust-cache and the icicle-bn254 revision lookup below
+      # have it to work with.
+      - run: cargo generate-lockfile
+      # rust-cache's own action.yml only saves the cache when the job has
+      # succeeded so far (post-if: "success() || env.CACHE_ON_FAILURE ==
+      # 'true'"). Since we're iterating on GPU test fixes, most runs fail at
+      # the Test step, which was silently skipping the save every time and
+      # forcing a full ~3 min recompile (ark-*, swanky, both icicle curves,
+      # co-snarks) on every single run. Force it to save regardless.
+      - uses: Swatinem/rust-cache@v2
+        env:
+          CACHE_ON_FAILURE: true
+      # This crate calls into icicle-core/icicle-runtime unconditionally, so
+      # tests need the native CUDA backend built from the exact icicle-snark
+      # commit pinned in Cargo.lock, with ICICLE_BACKEND_INSTALL_DIR pointing
+      # at it (see README.md). Skips the (re)build if that commit was already
+      # built on this runner.
+      - name: Build ICICLE CUDA backend
+        run: |
+          set -eux
+          rev=$(grep -A2 '^name = "icicle-bn254"' Cargo.lock | grep -oP '(?<=#)[0-9a-f]{40}')
+          install_dir="$HOME/.icicle-backend"
+          marker="$install_dir/.built-$rev"
+          if [ -f "$marker" ]; then
+            echo "ICICLE backend already built for $rev, skipping"
+          else
+            rm -rf "$install_dir" /tmp/icicle-snark
+            git clone https://github.com/ingonyama-zk/icicle-snark.git /tmp/icicle-snark
+            git -C /tmp/icicle-snark checkout "$rev"
+            for curve in bn254 bls12_377; do
+              cmake -S /tmp/icicle-snark/icicle -B "/tmp/icicle-snark/icicle/build-$curve" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCURVE=$curve \
+                -DCUDA_BACKEND=local \
+                -DCMAKE_INSTALL_PREFIX="$install_dir"
+              cmake --build "/tmp/icicle-snark/icicle/build-$curve" -j"$(nproc)" --target install
+            done
+            rm -rf /tmp/icicle-snark
+            mkdir -p "$install_dir"
+            touch "$marker"
+          fi
+          echo "ICICLE_BACKEND_INSTALL_DIR=$install_dir/lib/backend" >> "$GITHUB_ENV"
+      - name: Test
+        # --include-ignored: every icicle/GPU test in this crate is #[ignore]d
+        # so plain `cargo test` skips them on non-GPU machines; this runner
+        # has the CUDA backend built above, so run the full suite here.
+        # --test-threads=1: every test selects CUDA device 0 in-process, so
+        # running them concurrently means multiple large proofs (e.g.
+        # transaction_batched, penumbra_*) contend for one GPU at once.
+        run: cargo test --profile ci-dev -- --include-ignored --test-threads=1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

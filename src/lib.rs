@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    //#[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
+    #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_transaction_batched_bn254() {
         load_backend_from_env_and_set_device(0);
 
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    //#[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
+    #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_transaction_batched_bn254_rep3() {
         for check in [CheckElement::Yes, CheckElement::No] {
             let zkey_file =
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    //#[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
+    #[ignore = "Requires building the icicle backend with -DCURVE=bn254"]
     fn create_proof_transaction_batched_bn254_shamir() {
         const NUM_PARTIES: usize = 3;
         const THRESHOLD: usize = 1;

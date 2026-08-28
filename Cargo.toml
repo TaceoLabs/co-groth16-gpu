@@ -42,3 +42,11 @@ circom-types = { package = "taceo-circom-types", version = "0.3.1", features = [
     "bls12-381",
 ] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# This profile can be used for CI in pull requests.
+[profile.ci-dev]
+opt-level = 1
+inherits = "dev"
+incremental = false
+debug = true
+overflow-checks = false
