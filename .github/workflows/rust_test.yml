@@ -84,10 +84,25 @@ jobs:
       # 'true'"). Since we're iterating on GPU test fixes, most runs fail at
       # the Test step, which was silently skipping the save every time and
       # forcing a full ~3 min recompile (ark-*, swanky, both icicle curves,
-      # co-snarks) on every single run. Force it to save regardless.
+      # co-snarks) on every single run. Force it to save regardless via the
+      # documented input (restore.js reads the cache-on-failure *input*, not
+      # a pre-set CACHE_ON_FAILURE env var, and overwrites the latter with
+      # the input's default (false) either way).
+      #
+      # cache-targets: false — icicle-bn254/icicle-runtime's own build.rs
+      # runs a real `cmake --build --target install`, producing
+      # icicle_field_bn254/icicle_curve_bn254/icicle_device under
+      # target/.../out/.../deps/icicle/lib/ (separate from the CUDA backend
+      # we build ourselves into $HOME/.icicle-backend below). The one time
+      # this actually restored a cached target/, cargo trusted the restored
+      # build-script fingerprint and skipped re-running cmake, but the
+      # linker then couldn't find those libraries — the actual files didn't
+      # survive the cache round-trip intact. Keep caching the registry/git
+      # checkouts (safe, pure source data) but not target/.
       - uses: Swatinem/rust-cache@v2
-        env:
-          CACHE_ON_FAILURE: true
+        with:
+          cache-on-failure: true
+          cache-targets: false
       # This crate calls into icicle-core/icicle-runtime unconditionally, so
       # tests need the native CUDA backend built from the exact icicle-snark
       # commit pinned in Cargo.lock, with ICICLE_BACKEND_INSTALL_DIR pointing
@@ -105,7 +120,7 @@ jobs:
             rm -rf "$install_dir" /tmp/icicle-snark
             git clone https://github.com/ingonyama-zk/icicle-snark.git /tmp/icicle-snark
             git -C /tmp/icicle-snark checkout "$rev"
-            for curve in bn254 bls12_377; do
+            for curve in bn254; do
               cmake -S /tmp/icicle-snark/icicle -B "/tmp/icicle-snark/icicle/build-$curve" \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCURVE=$curve \
