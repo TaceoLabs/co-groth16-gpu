@@ -516,13 +516,25 @@ mod tests {
 
             let nets = LocalNetwork::new_3_parties();
 
+            // Prepare the key once and share it: preparing it per party would race on the
+            // global NTT domain (release_domain/initialize_domain) and segfault.
+            let prepared_key = Arc::new(prepare_bn254_key::<CircomReduction>(
+                &zkey1.1,
+                zkey1.0.num_constraints,
+                zkey1.0.num_instance_variables,
+            ));
+
             let mut threads = vec![];
             for (net, x, zkey) in izip!(
                 nets,
                 [witness_share1, witness_share2, witness_share3].into_iter(),
                 [zkey1, zkey2, zkey3].into_iter()
             ) {
+                let prepared_key = Arc::clone(&prepared_key);
                 threads.push(std::thread::spawn(move || {
+                    // icicle's active device is thread-local, so each party thread must set it
+                    load_backend_from_env_and_set_device(0);
+
                     let cpu_prove = |pkey, matrices, witness| {
                         co_groth16::Rep3CoGroth16::<Bn254>::prove::<
                             LocalNetwork,
@@ -544,7 +556,7 @@ mod tests {
                         cpu_prove = cpu_prove,
                         gpu_prove = gpu_prove,
                         pkey = &zkey.1,
-                        prepared_key = None,
+                        prepared_key = Some(prepared_key),
                         matrices = &zkey.0,
                         witness = x,
                         silent = net.id() != 0 // only print for the first party to avoid cluttering the output
