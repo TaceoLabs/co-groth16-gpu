@@ -108,10 +108,27 @@ jobs:
       # commit pinned in Cargo.lock, with ICICLE_BACKEND_INSTALL_DIR pointing
       # at it (see README.md). Skips the (re)build if that commit was already
       # built on this runner.
+      #
+      # The marker-file skip below only helps on a persistent runner; cache
+      # the install dir so ephemeral runners skip the ~10 min cmake build
+      # too. Keyed on the pinned icicle-snark rev (assumes the gpu-runner
+      # pool is homogeneous, since -DCUDA_BACKEND=local builds for the local
+      # GPU arch). Saved explicitly right after the build step so failing
+      # tests don't discard it.
+      - name: Compute ICICLE backend cache key
+        id: icicle-rev
+        run: |
+          echo "rev=$(grep -A2 '^name = "icicle-bn254"' Cargo.lock | grep -oP '(?<=#)[0-9a-f]{40}')" >> "$GITHUB_OUTPUT"
+      - name: Restore ICICLE backend cache
+        id: icicle-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.icicle-backend
+          key: icicle-backend-bn254-${{ steps.icicle-rev.outputs.rev }}
       - name: Build ICICLE CUDA backend
         run: |
           set -eux
-          rev=$(grep -A2 '^name = "icicle-bn254"' Cargo.lock | grep -oP '(?<=#)[0-9a-f]{40}')
+          rev=${{ steps.icicle-rev.outputs.rev }}
           install_dir="$HOME/.icicle-backend"
           marker="$install_dir/.built-$rev"
           if [ -f "$marker" ]; then
@@ -133,6 +150,12 @@ jobs:
             touch "$marker"
           fi
           echo "ICICLE_BACKEND_INSTALL_DIR=$install_dir/lib/backend" >> "$GITHUB_ENV"
+      - name: Save ICICLE backend cache
+        if: steps.icicle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.icicle-backend
+          key: icicle-backend-bn254-${{ steps.icicle-rev.outputs.rev }}
       - name: Test
         # --include-ignored: every icicle/GPU test in this crate is #[ignore]d
         # so plain `cargo test` skips them on non-GPU machines; this runner
