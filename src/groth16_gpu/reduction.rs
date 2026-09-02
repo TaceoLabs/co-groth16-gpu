@@ -1,7 +1,7 @@
 use eyre::Result;
 use icicle_core::vec_ops::{VecOpsConfig, scalar_mul, sub_scalars};
 use icicle_runtime::{
-    memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice},
+    memory::{DeviceSlice, DeviceVec, HostSlice},
     stream::IcicleStream,
 };
 use mpc_core::MpcState;
@@ -45,31 +45,29 @@ thread_local! {
     static REDUCTION_STREAMS: RefCell<ReductionStreams> = RefCell::new(ReductionStreams::new());
 }
 
-/// Reusable domain-sized device scratch buffers for the witness map. Keeping one of
-/// these alive across proofs avoids re-allocating the buffers on every run; buffers are
-/// (re)allocated lazily on first use or when the domain size changes.
+/// Domain-sized device scratch buffers for the witness map, fully allocated on
+/// construction. Keeping one of these alive across proofs avoids re-allocating the
+/// buffers on every run.
 pub struct ReductionScratch<F> {
+    /// Only used by [`CircomReduction`] (i.e. when `requires_eval_c` is false).
     c: Option<DeviceVec<F>>,
-    ab: Option<DeviceVec<F>>,
+    /// Only used by [`LibSnarkReduction`] (i.e. when `requires_eval_c` is true).
     sub: Option<DeviceVec<F>>,
+    ab: DeviceVec<F>,
     /// Holds the QAP witness `h` after [`R1CSToQAP::witness_map_from_r1cs_eval`].
-    pub(crate) h: Option<DeviceVec<F>>,
+    pub(crate) h: DeviceVec<F>,
 }
 
 impl<F> ReductionScratch<F> {
-    pub fn new() -> Self {
+    pub fn new(domain_size: usize, requires_eval_c: bool) -> Self {
+        let alloc =
+            || DeviceVec::device_malloc(domain_size).expect("Failed to allocate device vector");
         Self {
-            c: None,
-            ab: None,
-            sub: None,
-            h: None,
+            c: (!requires_eval_c).then(alloc),
+            sub: requires_eval_c.then(alloc),
+            ab: alloc(),
+            h: alloc(),
         }
-    }
-}
-
-impl<F> Default for ReductionScratch<F> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -140,7 +138,7 @@ impl R1CSToQAP for CircomReduction {
                 c: stream_c,
             } = &mut *streams;
 
-            let c = gpu_utils::get_or_alloc(&mut scratch.c, domain_size);
+            let c = scratch.c.as_mut().expect("allocated for CircomReduction");
             T::local_mul_vec::<B>(eval_a, eval_b, state, stream_c, c);
 
             // Computation of a
@@ -160,12 +158,12 @@ impl R1CSToQAP for CircomReduction {
 
             stream_b.synchronize().unwrap();
 
-            let ab = gpu_utils::get_or_alloc(&mut scratch.ab, domain_size);
+            let ab = &mut scratch.ab;
             T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, ab);
 
             stream_a.synchronize().unwrap();
 
-            let h = gpu_utils::get_or_alloc(&mut scratch.h, domain_size);
+            let h = &mut scratch.h;
 
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
@@ -248,13 +246,16 @@ impl R1CSToQAP for LibSnarkReduction {
 
             stream_b.synchronize().unwrap();
 
-            let ab = gpu_utils::get_or_alloc(&mut scratch.ab, domain_size);
+            let ab = &mut scratch.ab;
             T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, ab);
 
             stream_a.synchronize().unwrap();
 
-            let sub = gpu_utils::get_or_alloc(&mut scratch.sub, c.len());
-            let h = gpu_utils::get_or_alloc(&mut scratch.h, c.len());
+            let sub = scratch
+                .sub
+                .as_mut()
+                .expect("allocated for LibSnarkReduction");
+            let h = &mut scratch.h;
 
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;

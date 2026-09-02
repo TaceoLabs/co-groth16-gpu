@@ -72,15 +72,6 @@ fn upload_points_async<C: Curve + MSM<C>>(
     precomputed
 }
 
-/// Returns the cached device buffer, (re)allocating it if it is missing or its
-/// length does not match `len`.
-pub(crate) fn get_or_alloc<T>(buf: &mut Option<DeviceVec<T>>, len: usize) -> &mut DeviceVec<T> {
-    if buf.as_ref().is_none_or(|b| b.len() != len) {
-        *buf = Some(DeviceVec::device_malloc(len).expect("Failed to allocate device vector"));
-    }
-    buf.as_mut().unwrap()
-}
-
 pub fn from_host_slice<T>(slice: &[T]) -> DeviceVec<T> {
     let count = slice.len();
     let mut result = DeviceVec::device_malloc(count).expect("Failed to allocate device vector");
@@ -196,6 +187,8 @@ pub struct ProvingKey<
     pub(crate) domain_size: usize,
     pub(crate) precomputed_roots: DeviceVec<F>,
     pub(crate) num_constraints: usize,
+    pub(crate) num_instance_variables: usize,
+    pub(crate) num_witness_variables: usize,
 }
 
 pub struct ProofStreams {
@@ -355,6 +348,8 @@ impl<
             domain_size,
             precomputed_roots,
             num_constraints,
+            num_instance_variables,
+            num_witness_variables: a_query.len() - num_instance_variables,
         }
     }
 }
