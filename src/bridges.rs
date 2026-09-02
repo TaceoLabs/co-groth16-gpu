@@ -64,6 +64,23 @@ where
     Ok(icicle_scalars)
 }
 
+/// Uploads Arkworks scalars into `dst` (reusing the cached allocation when the length
+/// matches) and converts them out of Montgomery representation on the device.
+pub(crate) fn ark_scalars_to_device_into<T, I>(ark_scalars: &[T], dst: &mut Option<DeviceVec<I>>)
+where
+    T: PrimeField,
+    I: FieldImpl + MontgomeryConvertible,
+{
+    let dst = crate::gpu_utils::get_or_alloc(dst, ark_scalars.len());
+    // SAFETY: Reinterpreting Arkworks field elements as Icicle-specific scalars
+    let icicle_scalars = unsafe { transmute::<&[T], &[I]>(ark_scalars) };
+    dst.copy_from_host(icicle_runtime::memory::HostSlice::from_slice(
+        icicle_scalars,
+    ))
+    .expect("Failed to copy data from host to device");
+    I::from_mont(dst, &IcicleStream::default());
+}
+
 pub(crate) fn ark_to_icicle_scalar<T, I>(ark_scalar: T) -> I
 where
     T: PrimeField,

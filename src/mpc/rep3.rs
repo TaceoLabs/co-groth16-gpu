@@ -190,7 +190,8 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         b: &Self::DeviceShares,
         state: &mut Self::State,
         stream: &IcicleStream,
-    ) -> DeviceVec<F> {
+        result: &mut DeviceSlice<F>,
+    ) {
         let masking_fes = state
             .rngs
             .rand
@@ -213,17 +214,12 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         mul_scalars(&a.a, &b.b, tmp1.as_mut_slice(), &cfg).unwrap();
         mul_scalars(&a.b, &b.a, tmp2.as_mut_slice(), &cfg).unwrap();
 
-        let mut result = DeviceVec::device_malloc_async(a.b.len(), stream)
-            .expect("Failed to allocate device vector");
-
-        add_scalars(&tmp0, &tmp1, result.as_mut_slice(), &cfg).unwrap();
-        add_scalars(&tmp2, &result, tmp0.as_mut_slice(), &cfg).unwrap();
-        add_scalars(&tmp0, &masking_fes, result.as_mut_slice(), &cfg).unwrap();
+        add_scalars(&tmp0, &tmp1, result, &cfg).unwrap();
+        add_scalars(&tmp2, &*result, tmp0.as_mut_slice(), &cfg).unwrap();
+        add_scalars(&tmp0, &masking_fes, result, &cfg).unwrap();
         stream
             .synchronize()
             .expect("Failed to synchronize local_mul_vec stream");
-
-        result
     }
 
     fn local_mul<B: ArkIcicleBridge<IcicleScalarField = F>>(

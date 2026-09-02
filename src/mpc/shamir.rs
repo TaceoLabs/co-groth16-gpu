@@ -177,18 +177,16 @@ where
         b: &Self::DeviceShares,
         _: &mut Self::State,
         stream: &IcicleStream,
-    ) -> DeviceVec<F> {
-        let mut result = DeviceVec::device_malloc_async(a.len(), stream)
-            .expect("Failed to allocate device vector");
+        result: &mut DeviceSlice<F>,
+    ) {
         let mut cfg = VecOpsConfig::default();
         cfg.stream_handle = **stream;
         cfg.is_async = true;
 
-        mul_scalars(a, b, result.as_mut_slice(), &cfg).unwrap();
+        mul_scalars(a, b, result, &cfg).unwrap();
         stream
             .synchronize()
             .expect("Failed to synchronize local_mul_vec stream");
-        result
     }
 
     fn local_mul<B: ArkIcicleBridge<IcicleScalarField = F>>(
