@@ -20,8 +20,8 @@ use rayon::prelude::*;
 
 use crate::{
     bridges::{
-        ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar, ark_to_icicle_scalars,
-        icicle_to_ark_scalar,
+        ArkIcicleBridge, ark_scalars_to_device_into, ark_to_icicle_affine, ark_to_icicle_scalar,
+        ark_to_icicle_scalars, icicle_to_ark_scalar,
     },
     gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
 };
@@ -52,12 +52,6 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     type State = Rep3State;
 
     fn to_half_share(a: &Self::ArithmeticShare) -> F {
-        a.a
-    }
-
-    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F> {
-        // The `a` component alone is already a valid half share; move it out instead of
-        // allocating a fresh device buffer and copying into it.
         a.a
     }
 
@@ -135,12 +129,20 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         dst.b.index_mut(start..end).copy(&src.b).unwrap();
     }
 
-    fn shares_to_device<
+    fn alloc_device_shares(len: usize) -> Self::DeviceShares {
+        Self::DeviceShares {
+            a: DeviceVec::device_malloc(len).expect("Failed to allocate device vector"),
+            b: DeviceVec::device_malloc(len).expect("Failed to allocate device vector"),
+        }
+    }
+
+    fn shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
-    ) -> Self::DeviceShares {
+        dst: &mut Self::DeviceShares,
+    ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
         {
@@ -155,21 +157,17 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         let (shares_a, shares_b): (Vec<B::ArkScalarField>, Vec<B::ArkScalarField>) =
             shares.iter().map(|s| (s.a, s.b)).unzip();
 
-        let shares_a = from_host_slice(&shares_a);
-        let shares_b = from_host_slice(&shares_b);
-
-        let a = ark_to_icicle_scalars(shares_a).unwrap();
-        let b = ark_to_icicle_scalars(shares_b).unwrap();
-
-        Self::DeviceShares { a, b }
+        ark_scalars_to_device_into(&shares_a, &mut dst.a);
+        ark_scalars_to_device_into(&shares_b, &mut dst.b);
     }
 
-    fn half_shares_to_device<
+    fn half_shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
-    ) -> DeviceVec<F> {
+        dst: &mut DeviceVec<F>,
+    ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
         {
@@ -179,10 +177,30 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
             unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
+        ark_scalars_to_device_into(shares, dst);
+    }
 
-        let shares = from_host_slice(shares);
+    fn shares_to_half_share_device_into<
+        B: ArkIcicleBridge<IcicleScalarField = F>,
+        T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        shares: &[T::ArithmeticShare],
+        dst: &mut DeviceVec<F>,
+    ) {
+        if std::any::TypeId::of::<T>()
+            != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
+        {
+            panic!("Invalid driver: expected Rep3Groth16Driver");
+        }
 
-        ark_to_icicle_scalars(shares).unwrap()
+        // SAFETY: At this point we know the shares are safe to transmute
+        let shares = unsafe {
+            transmute::<&[T::ArithmeticShare], &[Rep3PrimeFieldShare<B::ArkScalarField>]>(shares)
+        };
+
+        // Only the `a` component is a half share; the `b` component never reaches the device.
+        let shares_a = shares.iter().map(|s| s.a).collect::<Vec<_>>();
+        ark_scalars_to_device_into(&shares_a, dst);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(

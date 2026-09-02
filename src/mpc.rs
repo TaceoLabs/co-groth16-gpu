@@ -2,9 +2,6 @@ pub(crate) mod plain;
 pub(crate) mod rep3;
 pub(crate) mod shamir;
 
-use std::mem::transmute;
-
-use co_groth16::ConstraintMatrices;
 use icicle_core::{
     curve::{Affine, Curve},
     ntt::NTT,
@@ -18,10 +15,7 @@ use icicle_runtime::{
 use mpc_core::MpcState;
 use mpc_net::Network;
 
-use crate::{
-    bridges::ArkIcicleBridge,
-    utils::{evaluate_constraint, evaluate_constraint_half_share},
-};
+use crate::bridges::ArkIcicleBridge;
 
 pub use plain::PlainGroth16Driver;
 pub use rep3::Rep3Groth16Driver;
@@ -75,9 +69,6 @@ pub trait CircomGroth16Prover<
     /// Converts a shared value to a half shared value. Local interaction only.
     fn to_half_share(a: &Self::ArithmeticShare) -> F;
 
-    /// Converts shared values to half shared values. Local interaction only.
-    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F>;
-
     /// Add a public point B in place to the shared point A
     fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
         _: <Self::State as MpcState>::PartyID,
@@ -102,75 +93,36 @@ pub trait CircomGroth16Prover<
 
     // ICICLE <-> ARK functions
 
-    /// Converts a vector of arithmetic shares to device shares.
-    fn shares_to_device<
+    /// Allocates an (uninitialized) vector of device shares of the given length.
+    fn alloc_device_shares(len: usize) -> Self::DeviceShares;
+
+    /// Uploads a vector of arithmetic shares into the pre-allocated device shares.
+    fn shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
-    ) -> Self::DeviceShares;
+        dst: &mut Self::DeviceShares,
+    );
 
-    /// Converts a vector of arithmetic shares to device shares.
-    fn half_shares_to_device<
+    /// Uploads a vector of arithmetic half shares into the pre-allocated device vector.
+    fn half_shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
-    ) -> DeviceVec<F>;
+        dst: &mut DeviceVec<F>,
+    );
 
-    /// Evaluates the constraints for a given party ID and transforms the results into device shares.
-    fn evaluate_constraints<
+    /// Uploads the half-share component of a vector of arithmetic shares into the
+    /// pre-allocated device vector. Local interaction only.
+    fn shares_to_half_share_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
-        id: <Self::State as MpcState>::PartyID,
-        matrices: &ConstraintMatrices<B::ArkScalarField>,
-        public_inputs: &[B::ArkScalarField],
-        private_witness: &[T::ArithmeticShare],
-        eval_c: bool,
-        domain_size: usize,
-    ) -> (
-        Self::DeviceShares,
-        Self::DeviceShares,
-        Option<DeviceVec<B::IcicleScalarField>>,
-    ) {
-        let id = unsafe {
-            transmute::<&<Self::State as MpcState>::PartyID, &<T::State as MpcState>::PartyID>(&id)
-        };
-
-        let eval_a = evaluate_constraint::<B::ArkPairing, T>(
-            *id,
-            domain_size,
-            &matrices.a,
-            public_inputs,
-            private_witness,
-        );
-        let eval_a = Self::shares_to_device::<B, T>(&eval_a);
-
-        let eval_b = evaluate_constraint::<B::ArkPairing, T>(
-            *id,
-            domain_size,
-            &matrices.b,
-            public_inputs,
-            private_witness,
-        );
-        let eval_b = Self::shares_to_device::<B, T>(&eval_b);
-
-        let eval_c = if eval_c {
-            let eval_c = evaluate_constraint_half_share::<B::ArkPairing, T>(
-                *id,
-                domain_size,
-                &matrices.c,
-                public_inputs,
-                private_witness,
-            );
-            Some(Self::half_shares_to_device::<B, T>(&eval_c))
-        } else {
-            None
-        };
-
-        (eval_a, eval_b, eval_c)
-    }
+        shares: &[T::ArithmeticShare],
+        dst: &mut DeviceVec<F>,
+    );
 
     /// Performs element-wise multiplication of two vectors of shared values, writing the
     /// result into `result` (which must have the same length as the inputs).
