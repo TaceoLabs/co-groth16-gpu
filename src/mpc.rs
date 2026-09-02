@@ -172,7 +172,8 @@ pub trait CircomGroth16Prover<
         (eval_a, eval_b, eval_c)
     }
 
-    /// Performs element-wise multiplication of two vectors of shared values.
+    /// Performs element-wise multiplication of two vectors of shared values, writing the
+    /// result into `result` (which must have the same length as the inputs).
     /// Does not perform any networking.
     ///
     /// # Security
@@ -182,7 +183,8 @@ pub trait CircomGroth16Prover<
         b: &Self::DeviceShares,
         state: &mut Self::State,
         stream: &IcicleStream,
-    ) -> DeviceVec<F>;
+        result: &mut DeviceSlice<F>,
+    );
 
     /// Performs multiplication of two shared values.
     /// Does not perform any networking.

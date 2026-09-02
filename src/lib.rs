@@ -10,7 +10,7 @@ use icicle_runtime::runtime;
 
 pub use groth16_gpu::{
     Bn254PreparedKey, CircomReduction, Groth16, LibSnarkReduction, R1CSToQAP, Rep3CoGroth16,
-    ShamirCoGroth16, prepare_bn254_key,
+    ShamirCoGroth16, ShamirCoGroth16Prover, prepare_bn254_key,
 };
 
 pub fn load_backend_from_env_and_set_device(device_idx: i32) {
@@ -47,7 +47,7 @@ mod tests {
 
     use crate::groth16_gpu::{Bn254PreparedKey, prepare_bn254_key};
     use crate::{
-        CircomReduction, Rep3CoGroth16, ShamirCoGroth16, groth16_gpu::Groth16,
+        CircomReduction, Rep3CoGroth16, ShamirCoGroth16Prover, groth16_gpu::Groth16,
         load_backend_from_env_and_set_device,
     };
 
@@ -433,29 +433,32 @@ mod tests {
                     if net.id() == 0 {
                         load_backend_from_env_and_set_device(0);
 
-                        let gpu_prove = |pkey, prepared_key, matrices, witness| {
-                            ShamirCoGroth16::<Bn254>::prove::<LocalNetwork, CircomReduction>(
-                                &net,
-                                NUM_PARTIES,
-                                THRESHOLD,
-                                pkey,
-                                prepared_key,
-                                matrices,
-                                witness,
-                            )
-                        };
-
                         let prepared_key = prepare_bn254_key::<CircomReduction>(
                             &zkey.1,
                             zkey.0.num_constraints,
                             zkey.0.num_instance_variables,
                         );
+                        let prepared_key = Arc::new(prepared_key);
+
+                        // A single stateful prover reused for both GPU runs, so the second
+                        // run exercises the cached GPU buffers.
+                        let mut prover = ShamirCoGroth16Prover::<Bn254>::from_prepared_key(
+                            NUM_PARTIES,
+                            THRESHOLD,
+                            Arc::clone(&prepared_key),
+                        );
+                        let mut gpu_prove = |_pkey,
+                                             _prepared_key: Option<Arc<Bn254PreparedKey>>,
+                                             matrices,
+                                             witness| {
+                            prover.prove::<LocalNetwork, CircomReduction>(&net, matrices, witness)
+                        };
 
                         run_provers!(
                             cpu_prove = cpu_prove,
                             gpu_prove = gpu_prove,
                             pkey = &zkey.1,
-                            prepared_key = Some(Arc::new(prepared_key)),
+                            prepared_key = Some(Arc::clone(&prepared_key)),
                             matrices = &zkey.0,
                             witness = x,
                             silent = false // only print for the first party to avoid cluttering the output
