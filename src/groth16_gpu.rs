@@ -19,7 +19,7 @@ use std::{marker::PhantomData, mem::transmute};
 
 use icicle_core::msm::MSM;
 
-use crate::bridges::{ArkIcicleBridge, Bls12_377Bridge, Bn254Bridge, ark_to_icicle_scalars};
+use crate::bridges::{ArkIcicleBridge, Bn254Bridge, ark_to_icicle_scalars};
 use crate::gpu_utils::{Proof, ProofStreams, ProvingKey, VerifyingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
@@ -64,11 +64,14 @@ pub type Bn254PreparedKey = ProvingKey<
     <Bn254Bridge as ArkIcicleBridge>::IcicleG2,
 >;
 
-type Bls12_377PreparedKey = ProvingKey<
-    <Bls12_377Bridge as ArkIcicleBridge>::IcicleScalarField,
-    <Bls12_377Bridge as ArkIcicleBridge>::IcicleG1,
-    <Bls12_377Bridge as ArkIcicleBridge>::IcicleG2,
->;
+// bls12_377/LibSnarkReduction support removed: not needed for our case atm,
+// and its h_query/domain_size length mismatch with LibSnarkReduction was
+// causing problems.
+// type Bls12_377PreparedKey = ProvingKey<
+//     <Bls12_377Bridge as ArkIcicleBridge>::IcicleScalarField,
+//     <Bls12_377Bridge as ArkIcicleBridge>::IcicleG1,
+//     <Bls12_377Bridge as ArkIcicleBridge>::IcicleG2,
+// >;
 
 pub fn prepare_bn254_key<R: R1CSToQAP>(
     pkey: &ark_groth16::ProvingKey<Bn254>,
@@ -83,18 +86,18 @@ pub fn prepare_bn254_key<R: R1CSToQAP>(
     )
 }
 
-pub fn prepare_bls12_377_key<R: R1CSToQAP>(
-    pkey: &ark_groth16::ProvingKey<ark_bls12_377::Bls12_377>,
-    num_constraints: usize,
-    num_instance_variables: usize,
-) -> Bls12_377PreparedKey {
-    ProvingKey::from_ark(
-        pkey,
-        num_constraints,
-        num_instance_variables,
-        R::requires_eval_c(),
-    )
-}
+// pub fn prepare_bls12_377_key<R: R1CSToQAP>(
+//     pkey: &ark_groth16::ProvingKey<ark_bls12_377::Bls12_377>,
+//     num_constraints: usize,
+//     num_instance_variables: usize,
+// ) -> Bls12_377PreparedKey {
+//     ProvingKey::from_ark(
+//         pkey,
+//         num_constraints,
+//         num_instance_variables,
+//         R::requires_eval_c(),
+//     )
+// }
 
 impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16Icicle<B, T> {
     #[expect(clippy::type_complexity)]
@@ -533,59 +536,62 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
             };
 
             Ok(proof.clone())
-        } else if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bls12_377::Bls12_377>()
-        {
-            let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
-                src_pairing = P,
-                dst_pairing = ark_bls12_377::Bls12_377,
-                dst_field = ark_bls12_377::Fr,
-                src_arithmetic_share = P::ScalarField,
-                dst_arithmetic_share = ark_bls12_377::Fr,
-                pkey,
-                matrices,
-                private_witness,
-                public_inputs
-            );
+        // bls12_377/LibSnarkReduction support removed: not needed for our
+        // use case, and its h_query/domain_size length mismatch with
+        // LibSnarkReduction was causing real problems.
+        // } else if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bls12_377::Bls12_377>()
+        // {
+        //     let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
+        //         src_pairing = P,
+        //         dst_pairing = ark_bls12_377::Bls12_377,
+        //         dst_field = ark_bls12_377::Fr,
+        //         src_arithmetic_share = P::ScalarField,
+        //         dst_arithmetic_share = ark_bls12_377::Fr,
+        //         pkey,
+        //         matrices,
+        //         private_witness,
+        //         public_inputs
+        //     );
 
-            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
-                CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::setup::<
-                    co_groth16::mpc::PlainGroth16Driver,
-                    R,
-                >(
-                    0, // id irrelevant in the
-                    matrices,
-                    private_witness,
-                    public_inputs,
-                    domain_size,
-                )?;
+        //     let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
+        //         CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::setup::<
+        //             co_groth16::mpc::PlainGroth16Driver,
+        //             R,
+        //         >(
+        //             0, // id irrelevant in the
+        //             matrices,
+        //             private_witness,
+        //             public_inputs,
+        //             domain_size,
+        //         )?;
 
-            let prepared_key = prepare_bls12_377_key::<R>(
-                key,
-                matrices.num_constraints,
-                matrices.num_instance_variables,
-            );
+        //     let prepared_key = prepare_bls12_377_key::<R>(
+        //         key,
+        //         matrices.num_constraints,
+        //         matrices.num_instance_variables,
+        //     );
 
-            let icicle_proof =
-                CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
-                    &(),
-                    &mut (),
-                    &mut eval_a,
-                    &mut eval_b,
-                    eval_c.as_mut(),
-                    &prepared_key,
-                    private_witness,
-                    &public_inputs,
-                )?;
+        //     let icicle_proof =
+        //         CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
+        //             &(),
+        //             &mut (),
+        //             &mut eval_a,
+        //             &mut eval_b,
+        //             eval_c.as_mut(),
+        //             &prepared_key,
+        //             private_witness,
+        //             &public_inputs,
+        //         )?;
 
-            let proof = icicle_proof.to_ark::<Bls12_377Bridge>();
+        //     let proof = icicle_proof.to_ark::<Bls12_377Bridge>();
 
-            let proof = unsafe {
-                transmute::<&ark_groth16::Proof<ark_bls12_377::Bls12_377>, &ark_groth16::Proof<P>>(
-                    &proof,
-                )
-            };
+        //     let proof = unsafe {
+        //         transmute::<&ark_groth16::Proof<ark_bls12_377::Bls12_377>, &ark_groth16::Proof<P>>(
+        //             &proof,
+        //         )
+        //     };
 
-            Ok(proof.clone())
+        //     Ok(proof.clone())
         } else {
             panic!("Unsupported pairing")
         }
