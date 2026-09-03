@@ -1,9 +1,6 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
-use crate::gpu_utils::{
-    PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, from_host_slice, get_first, msm_async,
-};
+use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, get_first, msm_async};
 use ark_bn254::Bn254;
-use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
@@ -19,13 +16,15 @@ use std::{marker::PhantomData, mem::transmute};
 
 use icicle_core::msm::MSM;
 
-use crate::bridges::{ArkIcicleBridge, Bn254Bridge, ark_to_icicle_scalars};
+use crate::bridges::{ArkIcicleBridge, Bn254Bridge, ark_scalars_to_device_into};
 use crate::gpu_utils::{Proof, ProofStreams, ProvingKey, VerifyingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
 use crate::mpc::shamir::ShamirGroth16Driver;
+use crate::utils::{evaluate_constraint, evaluate_constraint_half_share};
 
+use reduction::ReductionScratch;
 pub use reduction::{CircomReduction, LibSnarkReduction, R1CSToQAP};
 mod reduction;
 
@@ -53,9 +52,22 @@ pub struct ShamirCoGroth16<P> {
     phantom_data: PhantomData<P>,
 }
 
-/// A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
-pub struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> {
-    phantom_data: PhantomData<(B, T)>,
+/// The internal GPU prover backing the public prover types.
+///
+/// Owns the device-resident proving key and every reusable device buffer and stream, all
+/// allocated in [`Self::new`], so repeated [`Self::prove`] calls only pay for the
+/// witness-dependent uploads and compute.
+struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> {
+    prepared_key: Arc<ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>>,
+    scratch: ReductionScratch<B::IcicleScalarField>,
+    streams: ProofStreams,
+    /// Buffers for the witness-dependent inputs; contents are re-uploaded on every run.
+    eval_a: T::DeviceShares,
+    eval_b: T::DeviceShares,
+    /// Only allocated when the reduction requires the evaluation of the `C` matrix.
+    eval_c: Option<DeviceVec<B::IcicleScalarField>>,
+    witness_half_shares: DeviceVec<B::IcicleScalarField>,
+    public_inputs: DeviceVec<B::IcicleScalarField>,
 }
 
 pub type Bn254PreparedKey = ProvingKey<
@@ -100,75 +112,105 @@ pub fn prepare_bn254_key<R: R1CSToQAP>(
 // }
 
 impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16Icicle<B, T> {
-    #[expect(clippy::type_complexity)]
-    fn setup<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static, R: R1CSToQAP>(
-        id: <T::State as MpcState>::PartyID,
-        matrices: &ConstraintMatrices<B::ArkScalarField>,
-        private_witness: &[U::ArithmeticShare],
-        public_inputs: &[B::ArkScalarField],
-        domain_size: usize,
-    ) -> eyre::Result<(
-        T::DeviceShares,
-        T::DeviceShares,
-        Option<DeviceVec<B::IcicleScalarField>>,
-        DeviceVec<B::IcicleScalarField>,
-        T::DeviceShares,
-    )> {
-        let setup_timer = std::time::Instant::now();
+    /// Allocates all device buffers and streams for repeated proving with the given key.
+    fn new(
+        prepared_key: Arc<ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>>,
+        requires_eval_c: bool,
+    ) -> Self {
+        let alloc = |len| DeviceVec::device_malloc(len).expect("Failed to allocate device vector");
+        let domain_size = prepared_key.domain_size;
+        Self {
+            scratch: ReductionScratch::new(domain_size, requires_eval_c),
+            streams: ProofStreams::new(),
+            eval_a: T::alloc_device_shares(domain_size),
+            eval_b: T::alloc_device_shares(domain_size),
+            eval_c: requires_eval_c.then(|| alloc(domain_size)),
+            witness_half_shares: alloc(prepared_key.num_witness_variables),
+            public_inputs: alloc(prepared_key.num_instance_variables),
+            prepared_key,
+        }
+    }
 
-        let eval_timer = std::time::Instant::now();
-        let (eval_a, eval_b, eval_c) = T::evaluate_constraints::<B, U>(
-            id,
-            matrices,
+    /// Execute the Groth16 prover using the internal MPC driver: evaluates the constraints
+    /// on the host, uploads the witness-dependent inputs into the pre-allocated device
+    /// buffers, and creates the proof. `U` is the CPU-side driver matching `T`.
+    fn prove<
+        N: Network,
+        R: R1CSToQAP,
+        U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        &mut self,
+        net: &N,
+        state: &mut T::State,
+        matrices: &ConstraintMatrices<B::ArkScalarField>,
+        public_inputs: &[B::ArkScalarField],
+        private_witness: &[U::ArithmeticShare],
+    ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+        let setup_timer = std::time::Instant::now();
+        let id = state.id();
+        // SAFETY: matching GPU/CPU driver pairs use the same PartyID type
+        let id = unsafe {
+            transmute::<&<T::State as MpcState>::PartyID, &<U::State as MpcState>::PartyID>(&id)
+        };
+        let domain_size = self.prepared_key.domain_size;
+
+        let eval_a = evaluate_constraint::<B::ArkPairing, U>(
+            *id,
+            domain_size,
+            &matrices.a,
             public_inputs,
             private_witness,
-            R::requires_eval_c(),
-            domain_size,
         );
-        let eval_elapsed = eval_timer.elapsed();
+        T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a);
 
-        let witness_timer = std::time::Instant::now();
-        let private_witness = T::shares_to_device::<B, U>(private_witness);
-        let witness_elapsed = witness_timer.elapsed();
+        let eval_b = evaluate_constraint::<B::ArkPairing, U>(
+            *id,
+            domain_size,
+            &matrices.b,
+            public_inputs,
+            private_witness,
+        );
+        T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b);
 
-        let public_timer = std::time::Instant::now();
-        let public_inputs = ark_to_icicle_scalars(from_host_slice(public_inputs)).unwrap();
-        let public_elapsed = public_timer.elapsed();
+        if let Some(eval_c_buf) = self.eval_c.as_mut() {
+            let eval_c = evaluate_constraint_half_share::<B::ArkPairing, U>(
+                *id,
+                domain_size,
+                &matrices.c,
+                public_inputs,
+                private_witness,
+            );
+            T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf);
+        }
+
+        T::shares_to_half_share_device_into::<B, U>(private_witness, &mut self.witness_half_shares);
+        ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
 
         tracing::info!(
-            "Setup timings: evaluate_constraints={} ms, witness_to_device={} ms, public_to_device={} ms, total={} ms",
-            eval_elapsed.as_millis(),
-            witness_elapsed.as_millis(),
-            public_elapsed.as_millis(),
+            "Constraint evaluation + device upload took {} ms",
             setup_timer.elapsed().as_millis()
         );
 
-        Ok((eval_a, eval_b, eval_c, public_inputs, private_witness))
+        self.prove_inner::<N, R>(net, state)
     }
 
-    /// Execute the Groth16 prover using the internal MPC driver.
-    /// This version takes the Circom-generated constraint matrices as input and does not re-calculate them.
-    #[expect(clippy::too_many_arguments)]
+    /// Computes the QAP witness and creates the proof from the uploaded inputs.
     fn prove_inner<N: Network, R: R1CSToQAP>(
+        &mut self,
         net: &N,
         state: &mut T::State,
-        eval_a: &mut T::DeviceShares,
-        eval_b: &mut T::DeviceShares,
-        eval_c: Option<&mut DeviceVec<B::IcicleScalarField>>,
-        pkey: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
-        private_witness: T::DeviceShares,
-        public_inputs: &DeviceVec<B::IcicleScalarField>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let timer_start = std::time::Instant::now();
-        let h = R::witness_map_from_r1cs_eval::<B, T>(
+        R::witness_map_from_r1cs_eval::<B, T>(
             state,
-            eval_a,
-            eval_b,
-            eval_c,
-            public_inputs,
-            &pkey.precomputed_roots,
-            pkey.num_constraints,
-            pkey.domain_size,
+            &mut self.eval_a,
+            &mut self.eval_b,
+            self.eval_c.as_mut(),
+            &self.public_inputs,
+            &self.prepared_key.precomputed_roots,
+            self.prepared_key.num_constraints,
+            self.prepared_key.domain_size,
+            &mut self.scratch,
         )?;
         tracing::info!(
             "Witness map computation took {} ms",
@@ -177,18 +219,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
 
-        let private_witness_half_shares = T::to_half_share_vec(private_witness);
-
-        Self::create_proof_with_assignment(
-            net,
-            state,
-            pkey,
-            r,
-            s,
-            h,
-            public_inputs,
-            &private_witness_half_shares,
-        )
+        self.create_proof_with_assignment(net, state, r, s)
     }
 
     fn calculate_coeff<C>(
@@ -209,17 +240,17 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         (res.to_projective() + priv_acc.to_projective()).into()
     }
 
-    #[expect(clippy::too_many_arguments)]
+    /// Creates the proof from the QAP witness left in `self.scratch.h` by the reduction.
     fn create_proof_with_assignment<N: Network>(
+        &self,
         net: &N,
         state: &mut T::State,
-        pkey: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
         r: T::ArithmeticShare,
         s: T::ArithmeticShare,
-        h: DeviceVec<B::IcicleScalarField>,
-        input_assignment: &DeviceVec<B::IcicleScalarField>,
-        aux_assignment: &DeviceVec<B::IcicleScalarField>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+        let h = &self.scratch.h;
+        let input_assignment = &self.public_inputs;
+        let aux_assignment = &self.witness_half_shares;
         let total_timer = std::time::Instant::now();
         let ProvingKey {
             vk,
@@ -237,7 +268,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             l_query,
             h_query,
             ..
-        } = pkey;
+        } = self.prepared_key.as_ref();
 
         let VerifyingKey {
             alpha_g1,
@@ -251,9 +282,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let id = state.id();
 
-        let proof_streams = ProofStreams::new();
-        let stream_g1 = &proof_streams.g1;
-        let stream_g2 = &proof_streams.g2;
+        let stream_g1 = &self.streams.g1;
+        let stream_g2 = &self.streams.g2;
 
         let msm_timer = std::time::Instant::now();
         // Compute A
@@ -308,7 +338,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, &h, stream_g1, PRECOMPUTE_FACTOR_G1);
+        let h_acc = msm_async(h_query, h, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
@@ -408,59 +438,36 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     }
 }
 
-/// Transmutes Groth16 artifacts from a generic pairing `P` into concrete pairing
+/// Transmutes the prove inputs from the generic pairing `P` into a concrete pairing.
+/// Yields `(matrices, witness_shares, public_inputs)`.
 ///
 /// # Safety / Invariant
-/// This is only sound if the values you pass in are *actually* built for `$DstPair` / `$DstField`,
-/// but are currently being referenced through the generic `P` / `P::ScalarField` types.
-/// (I.e. `P == $DstPair` and `P::ScalarField == $DstField` in reality.)
-#[macro_export]
-macro_rules! transmute_groth16_artifacts {
-    (
-        src_pairing = $SrcPair:ty,
-        dst_pairing = $DstPair:ty,
-        dst_field   = $DstField:ty,
-        src_arithmetic_share = $SrcArithmeticShare:ty,
-        dst_arithmetic_share = $DstArithmeticShare:ty,
-        $pkey:expr,
-        $matrices:expr,
-        $private_witness:expr,
-        $public_inputs:expr
-    ) => {{
-        use core::mem::{size_of, transmute};
-
-        // Optional sanity checks (won't prove correctness, but can catch obvious mismatches)
-        debug_assert_eq!(
-            size_of::<ark_groth16::ProvingKey<$SrcPair>>(),
-            size_of::<ark_groth16::ProvingKey<$DstPair>>(),
-        );
-        debug_assert_eq!(
-            size_of::<Vec<<$SrcPair as ark_ec::pairing::Pairing>::ScalarField>>(),
-            size_of::<Vec<$DstField>>(),
-        );
-
-        let pkey = $pkey;
-        let matrices = $matrices;
-        let private_witness = $private_witness;
-        let public_inputs = $public_inputs;
-
+/// Only sound when `P` *is* the destination pairing, i.e. the values are actually built
+/// for it and merely referenced through the generic types.
+macro_rules! cast_prove_inputs {
+    ($SrcShare:ty => $DstShare:ty, $DstField:ty, $matrices:expr, $private_witness:expr) => {{
         unsafe {
             (
-                transmute::<&ark_groth16::ProvingKey<$SrcPair>, &ark_groth16::ProvingKey<$DstPair>>(
-                    pkey,
+                transmute::<&ConstraintMatrices<P::ScalarField>, &ConstraintMatrices<$DstField>>(
+                    $matrices,
                 ),
-                transmute::<&Vec<$SrcArithmeticShare>, &Vec<$DstArithmeticShare>>(private_witness),
-                transmute::<
-                    &ConstraintMatrices<<$SrcPair as ark_ec::pairing::Pairing>::ScalarField>,
-                    &ConstraintMatrices<$DstField>,
-                >(matrices),
-                transmute::<
-                    &Vec<<$SrcPair as ark_ec::pairing::Pairing>::ScalarField>,
-                    &Vec<$DstField>,
-                >(public_inputs),
+                transmute::<&[$SrcShare], &[$DstShare]>($private_witness.witness.as_slice()),
+                transmute::<&[P::ScalarField], &[$DstField]>(
+                    $private_witness.public_inputs.as_slice(),
+                ),
             )
         }
     }};
+}
+
+/// Transmutes a proof over the concrete pairing `Src` back to the generic `Dst`.
+///
+/// # Safety
+/// Only sound when `Src` and `Dst` are the same concrete pairing.
+unsafe fn cast_proof<Src: ark_ec::pairing::Pairing, Dst: ark_ec::pairing::Pairing>(
+    proof: ark_groth16::Proof<Src>,
+) -> ark_groth16::Proof<Dst> {
+    unsafe { transmute::<&ark_groth16::Proof<Src>, &ark_groth16::Proof<Dst>>(&proof) }.clone()
 }
 
 impl<P: ark_ec::pairing::Pairing> Groth16<P> {
@@ -468,137 +475,111 @@ impl<P: ark_ec::pairing::Pairing> Groth16<P> {
     /// initialized with the [`PlainGroth16Driver`].
     ///
     /// DOES NOT PERFORM ANY MPC. For a plain prover checkout the [Groth16 implementation of arkworks](https://docs.rs/ark-groth16/latest/ark_groth16/).
+    ///
+    /// This is a one-shot convenience wrapper around [`Groth16Prover`]; to amortize GPU
+    /// setup cost over multiple proofs, construct a [`Groth16Prover`] once and call
+    /// [`Groth16Prover::prove`] repeatedly.
     pub fn plain_prove<R: R1CSToQAP>(
         pkey: &ark_groth16::ProvingKey<P>,
         prepared_bn_254_key: Option<Arc<Bn254PreparedKey>>,
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, P::ScalarField>,
     ) -> Result<ark_groth16::Proof<P>> {
-        let public_inputs = &private_witness.public_inputs;
-        let private_witness = &private_witness.witness;
+        let mut prover = match prepared_bn_254_key {
+            Some(prepared_key)
+                if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() =>
+            {
+                Groth16Prover::<P, R>::from_prepared_bn254_key(prepared_key)
+            }
+            _ => Groth16Prover::<P, R>::new(pkey, matrices),
+        };
+        prover.prove(matrices, private_witness)
+    }
+}
 
-        // TODO CESAR: Duplicate
-        let domain = GeneralEvaluationDomain::<P::ScalarField>::new(
-            matrices.num_constraints + matrices.num_instance_variables,
-        )
-        .ok_or(eyre::eyre!("Polynomial Degree too large"))?;
-        let domain_size = domain.size();
+/// A stateful plain (single-party) Groth16 GPU prover for the reduction `R`.
+///
+/// The constructor prepares the proving key on the device and allocates all scratch
+/// buffers and streams, so repeated [`Self::prove`] calls only pay for the
+/// witness-dependent uploads and compute.
+///
+/// Only BN254 is supported; bls12_377/LibSnarkReduction support was removed since its
+/// h_query/domain_size length mismatch with LibSnarkReduction was causing real problems.
+pub struct Groth16Prover<P, R = CircomReduction> {
+    inner: CoGroth16Icicle<Bn254Bridge, PlainGroth16Driver>,
+    phantom_data: PhantomData<(P, R)>,
+}
 
-        if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() {
-            let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
-                src_pairing = P,
-                dst_pairing = ark_bn254::Bn254,
-                dst_field = ark_bn254::Fr,
-                src_arithmetic_share = P::ScalarField,
-                dst_arithmetic_share = ark_bn254::Fr,
-                pkey,
-                matrices,
-                private_witness,
-                public_inputs
-            );
-
-            let prepared_key = prepared_bn_254_key.unwrap_or_else(|| {
-                Arc::new(prepare_bn254_key::<R>(
-                    key,
-                    matrices.num_constraints,
-                    matrices.num_instance_variables,
-                ))
-            });
-
-            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
-                CoGroth16Icicle::<Bn254Bridge, PlainGroth16Driver>::setup::<
-                    co_groth16::mpc::PlainGroth16Driver,
-                    R,
-                >(
-                    0, // id irrelevant in the plain case
-                    matrices,
-                    private_witness,
-                    public_inputs,
-                    domain_size,
-                )?;
-
-            let icicle_proof =
-                CoGroth16Icicle::<Bn254Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
-                    &(),
-                    &mut (),
-                    &mut eval_a,
-                    &mut eval_b,
-                    eval_c.as_mut(),
-                    &prepared_key,
-                    private_witness,
-                    &public_inputs,
-                )?;
-
-            let proof = icicle_proof.to_ark::<Bn254Bridge>();
-
-            let proof = unsafe {
-                transmute::<&ark_groth16::Proof<ark_bn254::Bn254>, &ark_groth16::Proof<P>>(&proof)
+impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Groth16Prover<P, R> {
+    /// Prepares the proving key on the device and creates a prover.
+    pub fn new(
+        pkey: &ark_groth16::ProvingKey<P>,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+    ) -> Self {
+        let inner = if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() {
+            // SAFETY: P == Bn254, checked above
+            let pkey = unsafe {
+                transmute::<&ark_groth16::ProvingKey<P>, &ark_groth16::ProvingKey<ark_bn254::Bn254>>(
+                    pkey,
+                )
             };
-
-            Ok(proof.clone())
-        // bls12_377/LibSnarkReduction support removed: not needed for our
-        // use case, and its h_query/domain_size length mismatch with
-        // LibSnarkReduction was causing real problems.
-        // } else if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bls12_377::Bls12_377>()
-        // {
-        //     let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
-        //         src_pairing = P,
-        //         dst_pairing = ark_bls12_377::Bls12_377,
-        //         dst_field = ark_bls12_377::Fr,
-        //         src_arithmetic_share = P::ScalarField,
-        //         dst_arithmetic_share = ark_bls12_377::Fr,
-        //         pkey,
-        //         matrices,
-        //         private_witness,
-        //         public_inputs
-        //     );
-
-        //     let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
-        //         CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::setup::<
-        //             co_groth16::mpc::PlainGroth16Driver,
-        //             R,
-        //         >(
-        //             0, // id irrelevant in the
-        //             matrices,
-        //             private_witness,
-        //             public_inputs,
-        //             domain_size,
-        //         )?;
-
-        //     let prepared_key = prepare_bls12_377_key::<R>(
-        //         key,
-        //         matrices.num_constraints,
-        //         matrices.num_instance_variables,
-        //     );
-
-        //     let icicle_proof =
-        //         CoGroth16Icicle::<Bls12_377Bridge, PlainGroth16Driver>::prove_inner::<_, R>(
-        //             &(),
-        //             &mut (),
-        //             &mut eval_a,
-        //             &mut eval_b,
-        //             eval_c.as_mut(),
-        //             &prepared_key,
-        //             private_witness,
-        //             &public_inputs,
-        //         )?;
-
-        //     let proof = icicle_proof.to_ark::<Bls12_377Bridge>();
-
-        //     let proof = unsafe {
-        //         transmute::<&ark_groth16::Proof<ark_bls12_377::Bls12_377>, &ark_groth16::Proof<P>>(
-        //             &proof,
-        //         )
-        //     };
-
-        //     Ok(proof.clone())
+            let prepared_key = prepare_bn254_key::<R>(
+                pkey,
+                matrices.num_constraints,
+                matrices.num_instance_variables,
+            );
+            CoGroth16Icicle::new(Arc::new(prepared_key), R::requires_eval_c())
         } else {
             panic!("Unsupported pairing")
+        };
+        Self {
+            inner,
+            phantom_data: PhantomData,
         }
+    }
+
+    /// Creates a BN254 prover from an already device-prepared proving key, which must
+    /// have been prepared for the same reduction `R`.
+    pub fn from_prepared_bn254_key(prepared_key: Arc<Bn254PreparedKey>) -> Self {
+        if std::any::TypeId::of::<P>() != std::any::TypeId::of::<ark_bn254::Bn254>() {
+            panic!("Unsupported pairing");
+        }
+        Self {
+            inner: CoGroth16Icicle::new(prepared_key, R::requires_eval_c()),
+            phantom_data: PhantomData,
+        }
+    }
+
+    /// Creates a proof, reusing the cached GPU resources from previous runs.
+    pub fn prove(
+        &mut self,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+        private_witness: SharedWitness<P::ScalarField, P::ScalarField>,
+    ) -> Result<ark_groth16::Proof<P>> {
+        // SAFETY (all casts below): `new`/`from_prepared_bn254_key` only succeed for P == Bn254.
+        let (matrices, witness, public_inputs) = cast_prove_inputs!(
+            P::ScalarField => ark_bn254::Fr,
+            ark_bn254::Fr,
+            matrices,
+            private_witness
+        );
+        let icicle_proof = self
+            .inner
+            .prove::<_, R, co_groth16::mpc::PlainGroth16Driver>(
+                &(),
+                &mut (),
+                matrices,
+                public_inputs,
+                witness,
+            )?;
+        Ok(unsafe { cast_proof(icicle_proof.to_ark::<Bn254Bridge>()) })
     }
 }
 
 impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
+    /// This is a one-shot convenience wrapper around [`Rep3CoGroth16Prover`]; to amortize
+    /// GPU setup cost over multiple proofs, construct a [`Rep3CoGroth16Prover`] once and
+    /// call [`Rep3CoGroth16Prover::prove`] repeatedly.
     pub fn prove<N: Network, R: R1CSToQAP>(
         net: &N,
         pkey: &ark_groth16::ProvingKey<P>,
@@ -606,72 +587,11 @@ impl<P: ark_ec::pairing::Pairing> Rep3CoGroth16<P> {
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
     ) -> Result<ark_groth16::Proof<P>> {
-        let public_inputs = &private_witness.public_inputs;
-        let private_witness = &private_witness.witness;
-
-        // TODO CESAR: Duplicate
-        let domain = GeneralEvaluationDomain::<P::ScalarField>::new(
-            matrices.num_constraints + matrices.num_instance_variables,
-        )
-        .ok_or(eyre::eyre!("Polynomial Degree too large"))?;
-        let domain_size = domain.size();
-
-        let mut state = Rep3State::new(net, A2BType::default())?;
-
-        if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() {
-            let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
-                src_pairing = P,
-                dst_pairing = ark_bn254::Bn254,
-                dst_field = ark_bn254::Fr,
-                src_arithmetic_share = Rep3PrimeFieldShare<P::ScalarField>,
-                dst_arithmetic_share = Rep3PrimeFieldShare<ark_bn254::Fr>,
-                pkey,
-                matrices,
-                private_witness,
-                public_inputs
-            );
-
-            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
-                CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::setup::<
-                    co_groth16::mpc::Rep3Groth16Driver,
-                    R,
-                >(
-                    state.id(),
-                    matrices,
-                    private_witness,
-                    public_inputs,
-                    domain_size,
-                )?;
-
-            let prepared_key = prepared_bn254_key.unwrap_or_else(|| {
-                Arc::new(prepare_bn254_key::<R>(
-                    key,
-                    matrices.num_constraints,
-                    matrices.num_instance_variables,
-                ))
-            });
-            let icicle_proof =
-                CoGroth16Icicle::<Bn254Bridge, Rep3Groth16Driver>::prove_inner::<N, R>(
-                    net,
-                    &mut state,
-                    &mut eval_a,
-                    &mut eval_b,
-                    eval_c.as_mut(),
-                    &prepared_key,
-                    private_witness,
-                    &public_inputs,
-                )?;
-
-            let proof = icicle_proof.to_ark::<Bn254Bridge>();
-
-            let proof = unsafe {
-                transmute::<&ark_groth16::Proof<ark_bn254::Bn254>, &ark_groth16::Proof<P>>(&proof)
-            };
-
-            Ok(proof.clone())
-        } else {
-            panic!("Unsupported pairing")
-        }
+        let mut prover = match prepared_bn254_key {
+            Some(prepared_key) => Rep3CoGroth16Prover::<P, R>::from_prepared_key(prepared_key),
+            None => Rep3CoGroth16Prover::<P, R>::new(pkey, matrices),
+        };
+        prover.prove::<N>(net, matrices, private_witness)
     }
 
     /// Create a [`ark_groth16::Proof`] by locally translating the REP3 `witness` into a 3-party
@@ -713,7 +633,10 @@ impl<P: ark_ec::pairing::Pairing> ShamirCoGroth16<P> {
     /// degree-`2*threshold` sharing.
     ///
     /// Correlated randomness is preprocessed over `net` before the online phase.
-    #[expect(clippy::too_many_arguments)]
+    ///
+    /// This is a one-shot convenience wrapper around [`ShamirCoGroth16Prover`]; to amortize
+    /// GPU setup cost over multiple proofs, construct a [`ShamirCoGroth16Prover`] once and
+    /// call [`ShamirCoGroth16Prover::prove`] repeatedly.
     pub fn prove<N: Network, R: R1CSToQAP>(
         net: &N,
         num_parties: usize,
@@ -723,77 +646,186 @@ impl<P: ark_ec::pairing::Pairing> ShamirCoGroth16<P> {
         matrices: &ConstraintMatrices<P::ScalarField>,
         private_witness: SharedWitness<P::ScalarField, ShamirPrimeFieldShare<P::ScalarField>>,
     ) -> Result<ark_groth16::Proof<P>> {
-        let public_inputs = &private_witness.public_inputs;
-        let private_witness = &private_witness.witness;
+        let mut prover = match prepared_bn254_key {
+            Some(prepared_key) => ShamirCoGroth16Prover::<P, R>::from_prepared_key(
+                num_parties,
+                threshold,
+                prepared_key,
+            ),
+            None => ShamirCoGroth16Prover::<P, R>::new(num_parties, threshold, pkey, matrices),
+        };
+        prover.prove::<N>(net, matrices, private_witness)
+    }
+}
 
-        // TODO CESAR: Duplicate
-        let domain = GeneralEvaluationDomain::<P::ScalarField>::new(
-            matrices.num_constraints + matrices.num_instance_variables,
-        )
-        .ok_or(eyre::eyre!("Polynomial Degree too large"))?;
-        let domain_size = domain.size();
+/// A stateful REP3 Groth16 GPU prover for the reduction `R`.
+///
+/// The constructor allocates all GPU resources (device-resident proving key, scratch
+/// buffers, streams), so repeated [`Self::prove`] calls only pay for the
+/// witness-dependent uploads and compute.
+///
+/// Currently only supports BN254.
+pub struct Rep3CoGroth16Prover<P, R = CircomReduction> {
+    inner: CoGroth16Icicle<Bn254Bridge, Rep3Groth16Driver>,
+    phantom_data: PhantomData<(P, R)>,
+}
 
-        if std::any::TypeId::of::<P>() == std::any::TypeId::of::<ark_bn254::Bn254>() {
-            let (key, private_witness, matrices, public_inputs) = transmute_groth16_artifacts!(
-                src_pairing = P,
-                dst_pairing = ark_bn254::Bn254,
-                dst_field = ark_bn254::Fr,
-                src_arithmetic_share = ShamirPrimeFieldShare<P::ScalarField>,
-                dst_arithmetic_share = ShamirPrimeFieldShare<ark_bn254::Fr>,
-                pkey,
-                matrices,
-                private_witness,
-                public_inputs
-            );
-
-            // we need 2 corr rand pairs for the two rand calls
-            let num_pairs = 2;
-            let preprocessing = ShamirPreprocessing::new(num_parties, threshold, num_pairs, net)?;
-            let mut state = ShamirState::from(preprocessing);
-
-            let (mut eval_a, mut eval_b, mut eval_c, public_inputs, private_witness) =
-                CoGroth16Icicle::<Bn254Bridge, ShamirGroth16Driver<ark_bn254::Fr>>::setup::<
-                    co_groth16::mpc::ShamirGroth16Driver,
-                    R,
-                >(
-                    state.id(),
-                    matrices,
-                    private_witness,
-                    public_inputs,
-                    domain_size,
-                )?;
-
-            let prepared_key = prepared_bn254_key.unwrap_or_else(|| {
-                Arc::new(prepare_bn254_key::<R>(
-                    key,
-                    matrices.num_constraints,
-                    matrices.num_instance_variables,
-                ))
-            });
-            let icicle_proof =
-                CoGroth16Icicle::<Bn254Bridge, ShamirGroth16Driver<ark_bn254::Fr>>::prove_inner::<
-                    N,
-                    R,
-                >(
-                    net,
-                    &mut state,
-                    &mut eval_a,
-                    &mut eval_b,
-                    eval_c.as_mut(),
-                    &prepared_key,
-                    private_witness,
-                    &public_inputs,
-                )?;
-
-            let proof = icicle_proof.to_ark::<Bn254Bridge>();
-
-            let proof = unsafe {
-                transmute::<&ark_groth16::Proof<ark_bn254::Bn254>, &ark_groth16::Proof<P>>(&proof)
-            };
-
-            Ok(proof.clone())
-        } else {
-            panic!("Unsupported pairing")
+impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Rep3CoGroth16Prover<P, R> {
+    /// Creates a prover from an already device-prepared proving key, which must have been
+    /// prepared for the same reduction `R`.
+    pub fn from_prepared_key(prepared_key: Arc<Bn254PreparedKey>) -> Self {
+        if std::any::TypeId::of::<P>() != std::any::TypeId::of::<ark_bn254::Bn254>() {
+            panic!("Unsupported pairing");
         }
+        Self {
+            inner: CoGroth16Icicle::new(prepared_key, R::requires_eval_c()),
+            phantom_data: PhantomData,
+        }
+    }
+
+    /// Prepares the proving key on the device and creates a prover.
+    pub fn new(
+        pkey: &ark_groth16::ProvingKey<P>,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+    ) -> Self {
+        if std::any::TypeId::of::<P>() != std::any::TypeId::of::<ark_bn254::Bn254>() {
+            panic!("Unsupported pairing");
+        }
+        // SAFETY: P == Bn254, checked above
+        let pkey = unsafe {
+            transmute::<&ark_groth16::ProvingKey<P>, &ark_groth16::ProvingKey<ark_bn254::Bn254>>(
+                pkey,
+            )
+        };
+        let prepared_key = prepare_bn254_key::<R>(
+            pkey,
+            matrices.num_constraints,
+            matrices.num_instance_variables,
+        );
+        Self::from_prepared_key(Arc::new(prepared_key))
+    }
+
+    /// Creates a proof, reusing the cached GPU resources from previous runs.
+    /// See [`Rep3CoGroth16::prove`] for the protocol description.
+    pub fn prove<N: Network>(
+        &mut self,
+        net: &N,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+        private_witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
+    ) -> Result<ark_groth16::Proof<P>> {
+        // SAFETY: the constructors guarantee P == Bn254
+        let (matrices, witness, public_inputs) = cast_prove_inputs!(
+            Rep3PrimeFieldShare<P::ScalarField> => Rep3PrimeFieldShare<ark_bn254::Fr>,
+            ark_bn254::Fr,
+            matrices,
+            private_witness
+        );
+
+        let mut state = Rep3State::new(net, A2BType::default())?;
+
+        let icicle_proof = self
+            .inner
+            .prove::<N, R, co_groth16::mpc::Rep3Groth16Driver>(
+                net,
+                &mut state,
+                matrices,
+                public_inputs,
+                witness,
+            )?;
+        // SAFETY: the constructors guarantee P == Bn254
+        Ok(unsafe { cast_proof(icicle_proof.to_ark::<Bn254Bridge>()) })
+    }
+}
+
+/// A stateful Shamir Groth16 GPU prover for the reduction `R`.
+///
+/// The constructor allocates all GPU resources (device-resident proving key, scratch
+/// buffers, streams), so repeated [`Self::prove`] calls only pay for the
+/// witness-dependent uploads and compute.
+///
+/// Currently only supports BN254.
+pub struct ShamirCoGroth16Prover<P, R = CircomReduction> {
+    num_parties: usize,
+    threshold: usize,
+    inner: CoGroth16Icicle<Bn254Bridge, ShamirGroth16Driver<ark_bn254::Fr>>,
+    phantom_data: PhantomData<(P, R)>,
+}
+
+impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> ShamirCoGroth16Prover<P, R> {
+    /// Creates a prover from an already device-prepared proving key, which must have been
+    /// prepared for the same reduction `R`.
+    pub fn from_prepared_key(
+        num_parties: usize,
+        threshold: usize,
+        prepared_key: Arc<Bn254PreparedKey>,
+    ) -> Self {
+        if std::any::TypeId::of::<P>() != std::any::TypeId::of::<ark_bn254::Bn254>() {
+            panic!("Unsupported pairing");
+        }
+        Self {
+            num_parties,
+            threshold,
+            inner: CoGroth16Icicle::new(prepared_key, R::requires_eval_c()),
+            phantom_data: PhantomData,
+        }
+    }
+
+    /// Prepares the proving key on the device and creates a prover.
+    pub fn new(
+        num_parties: usize,
+        threshold: usize,
+        pkey: &ark_groth16::ProvingKey<P>,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+    ) -> Self {
+        if std::any::TypeId::of::<P>() != std::any::TypeId::of::<ark_bn254::Bn254>() {
+            panic!("Unsupported pairing");
+        }
+        // SAFETY: P == Bn254, checked above
+        let pkey = unsafe {
+            transmute::<&ark_groth16::ProvingKey<P>, &ark_groth16::ProvingKey<ark_bn254::Bn254>>(
+                pkey,
+            )
+        };
+        let prepared_key = prepare_bn254_key::<R>(
+            pkey,
+            matrices.num_constraints,
+            matrices.num_instance_variables,
+        );
+        Self::from_prepared_key(num_parties, threshold, Arc::new(prepared_key))
+    }
+
+    /// Creates a proof, reusing the cached GPU resources from previous runs.
+    /// See [`ShamirCoGroth16::prove`] for the protocol description.
+    pub fn prove<N: Network>(
+        &mut self,
+        net: &N,
+        matrices: &ConstraintMatrices<P::ScalarField>,
+        private_witness: SharedWitness<P::ScalarField, ShamirPrimeFieldShare<P::ScalarField>>,
+    ) -> Result<ark_groth16::Proof<P>> {
+        // SAFETY: the constructors guarantee P == Bn254
+        let (matrices, witness, public_inputs) = cast_prove_inputs!(
+            ShamirPrimeFieldShare<P::ScalarField> => ShamirPrimeFieldShare<ark_bn254::Fr>,
+            ark_bn254::Fr,
+            matrices,
+            private_witness
+        );
+
+        // we need 2 corr rand pairs for the two rand calls
+        let num_pairs = 2;
+        let preprocessing =
+            ShamirPreprocessing::new(self.num_parties, self.threshold, num_pairs, net)?;
+        let mut state = ShamirState::from(preprocessing);
+
+        let icicle_proof = self
+            .inner
+            .prove::<N, R, co_groth16::mpc::ShamirGroth16Driver>(
+                net,
+                &mut state,
+                matrices,
+                public_inputs,
+                witness,
+            )?;
+        // SAFETY: the constructors guarantee P == Bn254
+        Ok(unsafe { cast_proof(icicle_proof.to_ark::<Bn254Bridge>()) })
     }
 }

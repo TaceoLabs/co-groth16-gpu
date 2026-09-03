@@ -16,8 +16,10 @@ use rayon::prelude::*;
 use std::{mem::transmute, ops::IndexMut};
 
 use crate::{
-    bridges::{ArkIcicleBridge, ark_to_icicle_scalar, ark_to_icicle_scalars, icicle_to_ark_scalar},
-    gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
+    bridges::{
+        ArkIcicleBridge, ark_scalars_to_device_into, ark_to_icicle_scalar, icicle_to_ark_scalar,
+    },
+    gpu_utils::{fft_inplace, ifft_inplace, to_host_vec_icicle_scalar},
 };
 
 use super::CircomGroth16Prover;
@@ -36,11 +38,6 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     type State = ();
     fn to_half_share(a: &Self::ArithmeticShare) -> F {
         *a
-    }
-
-    fn to_half_share_vec(a: Self::DeviceShares) -> DeviceVec<F> {
-        // A plain share already *is* its half share, so there's nothing to convert.
-        a
     }
 
     fn promote_to_trivial_shares(
@@ -92,12 +89,17 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         dst.index_mut(start..end).copy(src).unwrap();
     }
 
-    fn shares_to_device<
+    fn alloc_device_shares(len: usize) -> Self::DeviceShares {
+        DeviceVec::device_malloc(len).expect("Failed to allocate device vector")
+    }
+
+    fn shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
-    ) -> Self::DeviceShares {
+        dst: &mut Self::DeviceShares,
+    ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
         {
@@ -106,17 +108,16 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // SAFETY: At this point we know the shares are safe to transmute
         let shares = unsafe { transmute::<&[T::ArithmeticShare], &[B::ArkScalarField]>(shares) };
-
-        let shares_icicle = from_host_slice(shares);
-        ark_to_icicle_scalars(shares_icicle).unwrap()
+        ark_scalars_to_device_into(shares, dst);
     }
 
-    fn half_shares_to_device<
+    fn half_shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
-    ) -> Self::DeviceShares {
+        dst: &mut DeviceVec<F>,
+    ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
         {
@@ -126,9 +127,18 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
             unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
+        ark_scalars_to_device_into(shares, dst);
+    }
 
-        let shares_icicle = from_host_slice(shares);
-        ark_to_icicle_scalars(shares_icicle).unwrap()
+    fn shares_to_half_share_device_into<
+        B: ArkIcicleBridge<IcicleScalarField = F>,
+        T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        shares: &[T::ArithmeticShare],
+        dst: &mut DeviceVec<F>,
+    ) {
+        // A plain share already *is* its half share, so there's nothing to convert.
+        Self::shares_to_device_into::<B, T>(shares, dst);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
@@ -136,18 +146,16 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         b: &Self::DeviceShares,
         _: &mut Self::State,
         stream: &IcicleStream,
-    ) -> DeviceVec<F> {
-        let mut result = DeviceVec::device_malloc_async(a.len(), stream)
-            .expect("Failed to allocate device vector");
+        result: &mut DeviceSlice<F>,
+    ) {
         let mut cfg = VecOpsConfig::default();
         cfg.stream_handle = **stream;
         cfg.is_async = true;
 
-        mul_scalars(a, b, result.as_mut_slice(), &cfg).unwrap();
+        mul_scalars(a, b, result, &cfg).unwrap();
         stream
             .synchronize()
             .expect("Failed to synchronize local_mul_vec stream");
-        result
     }
 
     fn local_mul<B: ArkIcicleBridge<IcicleScalarField = F>>(

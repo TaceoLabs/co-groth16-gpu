@@ -187,6 +187,8 @@ pub struct ProvingKey<
     pub(crate) domain_size: usize,
     pub(crate) precomputed_roots: DeviceVec<F>,
     pub(crate) num_constraints: usize,
+    pub(crate) num_instance_variables: usize,
+    pub(crate) num_witness_variables: usize,
 }
 
 pub struct ProofStreams {
@@ -346,6 +348,8 @@ impl<
             domain_size,
             precomputed_roots,
             num_constraints,
+            num_instance_variables,
+            num_witness_variables: a_query.len() - num_instance_variables,
         }
     }
 }

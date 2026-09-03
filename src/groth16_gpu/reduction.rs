@@ -1,7 +1,7 @@
 use eyre::Result;
 use icicle_core::vec_ops::{VecOpsConfig, scalar_mul, sub_scalars};
 use icicle_runtime::{
-    memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice},
+    memory::{DeviceSlice, DeviceVec, HostSlice},
     stream::IcicleStream,
 };
 use mpc_core::MpcState;
@@ -45,12 +45,39 @@ thread_local! {
     static REDUCTION_STREAMS: RefCell<ReductionStreams> = RefCell::new(ReductionStreams::new());
 }
 
+/// Domain-sized device scratch buffers for the witness map, fully allocated on
+/// construction. Keeping one of these alive across proofs avoids re-allocating the
+/// buffers on every run.
+pub struct ReductionScratch<F> {
+    /// Only used by [`CircomReduction`] (i.e. when `requires_eval_c` is false).
+    c: Option<DeviceVec<F>>,
+    /// Only used by [`LibSnarkReduction`] (i.e. when `requires_eval_c` is true).
+    sub: Option<DeviceVec<F>>,
+    ab: DeviceVec<F>,
+    /// Holds the QAP witness `h` after [`R1CSToQAP::witness_map_from_r1cs_eval`].
+    pub(crate) h: DeviceVec<F>,
+}
+
+impl<F> ReductionScratch<F> {
+    pub fn new(domain_size: usize, requires_eval_c: bool) -> Self {
+        let alloc =
+            || DeviceVec::device_malloc(domain_size).expect("Failed to allocate device vector");
+        Self {
+            c: (!requires_eval_c).then(alloc),
+            sub: requires_eval_c.then(alloc),
+            ab: alloc(),
+            h: alloc(),
+        }
+    }
+}
+
 /// This trait is used to convert the secret-shared witness into a secret-shared QAP witness as part of a collaborative Groth16 proof.
 /// Refer to <https://docs.rs/ark-groth16/latest/ark_groth16/r1cs_to_qap/trait.R1CSToQAP.html> for more details on the plain version.
 /// We do not implement the other methods of the arkworks trait, as we do not need them during proof generation.
 pub trait R1CSToQAP {
     /// Computes a QAP witness corresponding to the R1CS witness defined by `private_witness`, using the provided `ConstraintMatrices`.
     /// The provided `driver` is used to perform the necessary operations on the secret-shared witness.
+    /// The result is left in `scratch.h`; `scratch` buffers are reused across calls.
     #[expect(clippy::too_many_arguments)]
     fn witness_map_from_r1cs_eval<
         B: ArkIcicleBridge,
@@ -64,7 +91,8 @@ pub trait R1CSToQAP {
         roots_to_power_domain: &DeviceSlice<B::IcicleScalarField>,
         num_constraints: usize,
         domain_size: usize,
-    ) -> Result<DeviceVec<B::IcicleScalarField>>;
+        scratch: &mut ReductionScratch<B::IcicleScalarField>,
+    ) -> Result<()>;
 
     fn requires_eval_c() -> bool;
 }
@@ -92,7 +120,8 @@ impl R1CSToQAP for CircomReduction {
         roots_to_power_domain: &DeviceSlice<B::IcicleScalarField>,
         num_constraints: usize,
         domain_size: usize,
-    ) -> Result<DeviceVec<B::IcicleScalarField>> {
+        scratch: &mut ReductionScratch<B::IcicleScalarField>,
+    ) -> Result<()> {
         assert!(eval_c.is_none());
 
         let id = state.id();
@@ -101,7 +130,7 @@ impl R1CSToQAP for CircomReduction {
         let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
         T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
 
-        let result = REDUCTION_STREAMS.with(|streams| {
+        REDUCTION_STREAMS.with(|streams| {
             let mut streams = streams.borrow_mut();
             let ReductionStreams {
                 a: stream_a,
@@ -109,7 +138,8 @@ impl R1CSToQAP for CircomReduction {
                 c: stream_c,
             } = &mut *streams;
 
-            let mut c = T::local_mul_vec::<B>(eval_a, eval_b, state, stream_c);
+            let c = scratch.c.as_mut().expect("allocated for CircomReduction");
+            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_c, c);
 
             // Computation of a
             T::ifft_in_place(eval_a, stream_a, None);
@@ -122,29 +152,28 @@ impl R1CSToQAP for CircomReduction {
             T::fft_in_place(eval_b, stream_b, None);
 
             // Computation of c
-            gpu_utils::ifft_inplace(&mut c, stream_c, None);
-            T::distribute_powers_and_mul_by_const_hs(&mut c, roots_to_power_domain, stream_c);
-            gpu_utils::fft_inplace(&mut c, stream_c, None);
+            gpu_utils::ifft_inplace(c, stream_c, None);
+            T::distribute_powers_and_mul_by_const_hs(c, roots_to_power_domain, stream_c);
+            gpu_utils::fft_inplace(c, stream_c, None);
 
             stream_b.synchronize().unwrap();
 
-            let ab = T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a);
+            let ab = &mut scratch.ab;
+            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, ab);
 
             stream_a.synchronize().unwrap();
 
-            let mut result = DeviceVec::device_malloc_async(c.len(), stream_c)
-                .expect("Failed to allocate device vector");
+            let h = &mut scratch.h;
 
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
             cfg.is_async = true;
-            sub_scalars(&ab, &c, result.as_mut_slice(), &cfg).unwrap();
+            sub_scalars(&*ab, &*c, h.as_mut_slice(), &cfg).unwrap();
 
             stream_c.synchronize().unwrap();
-            result
         });
 
-        Ok(result)
+        Ok(())
     }
 
     fn requires_eval_c() -> bool {
@@ -173,7 +202,8 @@ impl R1CSToQAP for LibSnarkReduction {
         _: &DeviceSlice<B::IcicleScalarField>,
         num_constraints: usize,
         domain_size: usize,
-    ) -> Result<DeviceVec<B::IcicleScalarField>> {
+        scratch: &mut ReductionScratch<B::IcicleScalarField>,
+    ) -> Result<()> {
         assert!(eval_c.is_some());
 
         let c = eval_c.unwrap();
@@ -194,7 +224,7 @@ impl R1CSToQAP for LibSnarkReduction {
         let vanishing_polynomial_over_coset =
             [ark_to_icicle_scalar(vanishing_polynomial_over_coset)];
 
-        let result = REDUCTION_STREAMS.with(|streams| {
+        REDUCTION_STREAMS.with(|streams| {
             let mut streams = streams.borrow_mut();
             let ReductionStreams {
                 a: stream_a,
@@ -216,34 +246,35 @@ impl R1CSToQAP for LibSnarkReduction {
 
             stream_b.synchronize().unwrap();
 
-            let ab = T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a);
+            let ab = &mut scratch.ab;
+            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, ab);
 
             stream_a.synchronize().unwrap();
 
-            let mut sub = DeviceVec::device_malloc_async(c.len(), stream_c)
-                .expect("Failed to allocate device vector");
-            let mut result = DeviceVec::device_malloc_async(c.len(), stream_c)
-                .expect("Failed to allocate device vector");
+            let sub = scratch
+                .sub
+                .as_mut()
+                .expect("allocated for LibSnarkReduction");
+            let h = &mut scratch.h;
 
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
             cfg.is_async = true;
-            sub_scalars(&ab, c, sub.as_mut_slice(), &cfg).unwrap();
+            sub_scalars(&*ab, c, sub.as_mut_slice(), &cfg).unwrap();
             scalar_mul(
                 HostSlice::from_slice(&vanishing_polynomial_over_coset),
-                &sub,
-                result.as_mut_slice(),
+                &*sub,
+                h.as_mut_slice(),
                 &cfg,
             )
             .unwrap();
 
-            gpu_utils::ifft_inplace(result.as_mut_slice(), stream_c, coset_gen);
+            gpu_utils::ifft_inplace(h.as_mut_slice(), stream_c, coset_gen);
 
             stream_c.synchronize().unwrap();
-            result
         });
 
-        Ok(result)
+        Ok(())
     }
 
     fn requires_eval_c() -> bool {
