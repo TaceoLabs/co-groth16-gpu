@@ -1,5 +1,3 @@
-use std::ops::IndexMut;
-
 use ark_ff::FftField;
 use ark_poly::EvaluationDomain;
 use ark_poly::GeneralEvaluationDomain;
@@ -35,7 +33,7 @@ macro_rules! rayon_join_5 {
     }};
 }
 
-use crate::bridges::{ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar};
+use crate::bridges::{ark_to_icicle_affine, ark_to_icicle_scalar};
 use crate::utils::root_of_unity_for_groth16;
 
 fn upload_points_async<C: Curve + MSM<C>>(
@@ -98,46 +96,6 @@ pub fn to_host_vec_icicle_scalar<F: FieldImpl>(slice: &DeviceSlice<F>) -> Vec<F>
     host_vec
 }
 
-pub fn get_first<C: Curve>(vec: &DeviceVec<Projective<C>>) -> Projective<C> {
-    let mut result = [Projective::<C>::zero(); 1];
-    let host_slice = HostSlice::from_mut_slice(&mut result);
-    vec.copy_to_host(host_slice)
-        .expect("Failed to copy data from device to host");
-    result[0]
-}
-
-pub(crate) struct Proof<
-    F: FieldImpl<Config: VecOps<F> + NTT<F, F>>,
-    C1: Curve<ScalarField = F>,
-    C2: Curve<ScalarField = F>,
-> {
-    /// The `A` element in `G1`.
-    pub a: Affine<C1>,
-    /// The `B` element in `G2`.
-    pub b: Affine<C2>,
-    /// The `C` element in `G1`.
-    pub c: Affine<C1>,
-}
-
-impl<
-    F: FieldImpl<Config: VecOps<F> + NTT<F, F>>,
-    C1: Curve<ScalarField = F>,
-    C2: Curve<ScalarField = F>,
-> Proof<F, C1, C2>
-{
-    pub(crate) fn to_ark<
-        B: ArkIcicleBridge<IcicleG1 = C1, IcicleG2 = C2, IcicleScalarField = F>,
-    >(
-        &self,
-    ) -> ark_groth16::Proof<B::ArkPairing> {
-        ark_groth16::Proof {
-            a: B::icicle_to_ark_g1(self.a),
-            b: B::icicle_to_ark_g2(self.b),
-            c: B::icicle_to_ark_g1(self.c),
-        }
-    }
-}
-
 pub(crate) struct VerifyingKey<
     F: FieldImpl<Config: VecOps<F> + NTT<F, F>>,
     C1: Curve<ScalarField = F>,
@@ -168,18 +126,18 @@ pub struct ProvingKey<
     pub(crate) b_g1_query_first: Affine<C1>,
     /// The first `b_i * H` query element used in B(G2) commitment.
     pub(crate) b_g2_query_first: Affine<C2>,
-    /// The public slice of `a_query` excluding index 0.
-    pub(crate) a_query_pub: DeviceVec<Affine<C1>>,
-    /// The private-witness slice of `a_query`.
-    pub(crate) a_query_priv: DeviceVec<Affine<C1>>,
-    /// The public slice of `b_g1_query` excluding index 0.
-    pub(crate) b_g1_query_pub: DeviceVec<Affine<C1>>,
-    /// The private-witness slice of `b_g1_query`.
-    pub(crate) b_g1_query_priv: DeviceVec<Affine<C1>>,
-    /// The public slice of `b_g2_query` excluding index 0.
-    pub(crate) b_g2_query_pub: DeviceVec<Affine<C2>>,
-    /// The private-witness slice of `b_g2_query`.
-    pub(crate) b_g2_query_priv: DeviceVec<Affine<C2>>,
+    /// `a_query` excluding index 0 (the constant-1 wire), covering both the public and
+    /// private-witness variables in one contiguous table. An MSM is linear, so
+    /// `MSM(a_query[1..], public ++ witness)` equals the sum of the separately-computed
+    /// public and private MSMs the split tables used to require -- merging them removes
+    /// two of the eight MSMs per proof (and their result read-back) at no extra device
+    /// memory (the combined precomputed table is exactly as large as the two split ones
+    /// together).
+    pub(crate) a_query: DeviceVec<Affine<C1>>,
+    /// `b_g1_query` excluding index 0, same layout as [`Self::a_query`].
+    pub(crate) b_g1_query: DeviceVec<Affine<C1>>,
+    /// `b_g2_query` excluding index 0, same layout as [`Self::a_query`].
+    pub(crate) b_g2_query: DeviceVec<Affine<C2>>,
     /// The elements `h_i * G` in `E::G1`.
     pub(crate) h_query: DeviceVec<Affine<C1>>,
     /// The elements `l_i * G` in `E::G1`.
@@ -274,30 +232,21 @@ impl<
         let b_g1_query_first = b_g1_query[0];
         let b_g2_query_first = b_g2_query[0];
 
-        let a_query_pub_host = a_query[1..num_instance_variables].to_vec();
-        let a_query_priv_host = a_query[num_instance_variables..].to_vec();
-        let b_g1_query_pub_host = b_g1_query[1..num_instance_variables].to_vec();
-        let b_g1_query_priv_host = b_g1_query[num_instance_variables..].to_vec();
-        let b_g2_query_pub_host = b_g2_query[1..num_instance_variables].to_vec();
-        let b_g2_query_priv_host = b_g2_query[num_instance_variables..].to_vec();
+        let a_query_host = a_query[1..].to_vec();
+        let b_g1_query_host = b_g1_query[1..].to_vec();
+        let b_g2_query_host = b_g2_query[1..].to_vec();
 
-        let mut streams = (0..8)
+        let mut streams = (0..5)
             .map(|_| IcicleStream::create().unwrap())
             .collect::<Vec<_>>();
 
-        let a_query_pub = upload_points_async(&a_query_pub_host, &streams[0], PRECOMPUTE_FACTOR_G1);
-        let a_query_priv =
-            upload_points_async(&a_query_priv_host, &streams[1], PRECOMPUTE_FACTOR_G1);
-        let b_g1_query_pub =
-            upload_points_async(&b_g1_query_pub_host, &streams[2], PRECOMPUTE_FACTOR_G1);
-        let b_g1_query_priv =
-            upload_points_async(&b_g1_query_priv_host, &streams[3], PRECOMPUTE_FACTOR_G1);
-        let b_g2_query_pub =
-            upload_points_async(&b_g2_query_pub_host, &streams[4], PRECOMPUTE_FACTOR_G2);
-        let b_g2_query_priv =
-            upload_points_async(&b_g2_query_priv_host, &streams[5], PRECOMPUTE_FACTOR_G2);
-        let h_query = upload_points_async(&h_query_host, &streams[6], PRECOMPUTE_FACTOR_G1);
-        let l_query = upload_points_async(&l_query_host, &streams[7], PRECOMPUTE_FACTOR_G1);
+        let a_query_dev = upload_points_async(&a_query_host, &streams[0], PRECOMPUTE_FACTOR_G1);
+        let b_g1_query_dev =
+            upload_points_async(&b_g1_query_host, &streams[1], PRECOMPUTE_FACTOR_G1);
+        let b_g2_query_dev =
+            upload_points_async(&b_g2_query_host, &streams[2], PRECOMPUTE_FACTOR_G2);
+        let h_query = upload_points_async(&h_query_host, &streams[3], PRECOMPUTE_FACTOR_G1);
+        let l_query = upload_points_async(&l_query_host, &streams[4], PRECOMPUTE_FACTOR_G1);
 
         streams.iter_mut().for_each(|stream| {
             stream.synchronize().unwrap();
@@ -337,12 +286,9 @@ impl<
             a_query_first,
             b_g1_query_first,
             b_g2_query_first,
-            a_query_pub,
-            a_query_priv,
-            b_g1_query_pub,
-            b_g1_query_priv,
-            b_g2_query_pub,
-            b_g2_query_priv,
+            a_query: a_query_dev,
+            b_g1_query: b_g1_query_dev,
+            b_g2_query: b_g2_query_dev,
             h_query,
             l_query,
             domain_size,
@@ -397,17 +343,22 @@ pub(crate) fn ifft_inplace<F: FieldImpl<Config: VecOps<F> + NTT<F, F>>>(
         .expect("Failed to compute inverse FFT in place");
 }
 
-pub(crate) fn msm_async<
+/// Enqueues an MSM on `stream`, writing the single projective result into `result`.
+///
+/// The result slot is owned by the caller (a slice of a long-lived buffer) rather than
+/// allocated here: `DeviceVec`'s `Drop` frees through the *synchronous* `icicle_free`, so
+/// a per-MSM result buffer costs a device-wide synchronization per MSM, and reading the
+/// results back one at a time costs one blocking device-to-host copy each.
+pub(crate) fn msm_into<
     F: FieldImpl<Config: VecOps<F> + NTT<F, F>>,
     C: Curve<ScalarField = F> + MSM<C>,
 >(
     points: &DeviceSlice<Affine<C>>,
     scalars: &DeviceSlice<F>,
+    result: &mut DeviceSlice<Projective<C>>,
     stream: &IcicleStream,
     precompute_factor: i32,
-) -> DeviceVec<Projective<C>> {
-    let mut results: DeviceVec<Projective<C>> =
-        DeviceVec::device_malloc_async(1, stream).expect("Failed to allocate device vector");
+) {
     let mut cfg = MSMConfig::default();
     cfg.stream_handle = **stream;
     cfg.is_async = true;
@@ -416,6 +367,5 @@ pub(crate) fn msm_async<
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
 
-    msm::<C>(scalars, points, &cfg, results.index_mut(..)).expect("Failed to compute MSM");
-    results
+    msm::<C>(scalars, points, &cfg, result).expect("Failed to compute MSM");
 }

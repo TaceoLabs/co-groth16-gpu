@@ -17,7 +17,7 @@ Ensure the following tools are installed and available in your `PATH`:
 - **Git**
 - **CMake**
 - **C/C++ toolchain**
-- **CUDA toolkit** (required when using the local CUDA backend)
+- **CUDA toolkit** (required when using the local CUDA backend; not needed for the CPU backend below)
 
 ---
 
@@ -44,6 +44,34 @@ cmake -S . -B build \
 
 cmake --build build -j
 ```
+
+### Testing without a GPU
+
+ICICLE also ships a CPU reference backend (`CPU_BACKEND`, on by default), which
+requires no CUDA toolkit or GPU hardware. Drop `-DCUDA_BACKEND=local` to build
+only that backend:
+
+```bash
+cd icicle-snark/icicle
+
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCURVE=bn254
+
+cmake --build build -j
+```
+
+Then set `ICICLE_DEVICE_TYPE=CPU` (in addition to `ICICLE_BACKEND_INSTALL_DIR`
+below) so `load_backend_from_env_and_set_device` selects the CPU device
+instead of CUDA:
+
+```bash
+export ICICLE_DEVICE_TYPE=CPU
+cargo test -- --ignored
+```
+
+This is slower than the GPU path but exercises the same MSM/NTT/proving logic,
+so it's useful for local correctness testing.
 
 ---
 

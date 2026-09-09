@@ -5,7 +5,7 @@ use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{BigInteger, PrimeField};
 use icicle_core::curve::{Affine, Curve};
 use icicle_core::traits::{Arithmetic, FieldImpl, MontgomeryConvertible};
-use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
+use icicle_runtime::memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice};
 
 use icicle_core::{
     msm::MSM,
@@ -71,14 +71,38 @@ where
     T: PrimeField,
     I: FieldImpl + MontgomeryConvertible,
 {
-    assert_eq!(ark_scalars.len(), dst.len(), "device buffer size mismatch");
+    ark_scalars_to_device_into_at(ark_scalars, dst, 0);
+}
+
+/// Uploads Arkworks scalars into `dst[start..start + ark_scalars.len()]` and converts just
+/// that range out of Montgomery representation, leaving the rest of `dst` untouched.
+///
+/// Used for the domain-padded constraint-evaluation buffers: the host only ever computes
+/// `num_constraints` entries (the always-zero domain padding is handled separately, on the
+/// device, via a plain memset -- Montgomery-zero and native-zero are both the all-zero bit
+/// pattern, so the padding never needs `from_mont` applied to it).
+pub(crate) fn ark_scalars_to_device_into_at<T, I>(
+    ark_scalars: &[T],
+    dst: &mut DeviceVec<I>,
+    start: usize,
+) where
+    T: PrimeField,
+    I: FieldImpl + MontgomeryConvertible,
+{
+    let end = start + ark_scalars.len();
+    assert!(
+        end <= dst.len(),
+        "device buffer too small for offset + data"
+    );
     // SAFETY: Reinterpreting Arkworks field elements as Icicle-specific scalars
     let icicle_scalars = unsafe { transmute::<&[T], &[I]>(ark_scalars) };
-    dst.copy_from_host(icicle_runtime::memory::HostSlice::from_slice(
-        icicle_scalars,
-    ))
-    .expect("Failed to copy data from host to device");
-    I::from_mont(dst, &IcicleStream::default());
+    let dst_slice: &mut DeviceSlice<I> = &mut dst[start..end];
+    dst_slice
+        .copy_from_host(icicle_runtime::memory::HostSlice::from_slice(
+            icicle_scalars,
+        ))
+        .expect("Failed to copy data from host to device");
+    I::from_mont(dst_slice, &IcicleStream::default());
 }
 
 pub(crate) fn ark_to_icicle_scalar<T, I>(ark_scalar: T) -> I

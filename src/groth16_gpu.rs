@@ -1,23 +1,24 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
-use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, get_first, msm_async};
+use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, msm_into};
 use ark_bn254::Bn254;
+use ark_ec::CurveGroup;
 use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
-use icicle_core::curve::{Affine, Curve, Projective};
-use icicle_runtime::memory::DeviceVec;
+use icicle_core::curve::{Affine, Projective};
+use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice, HostSlice};
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_core::protocols::shamir::{ShamirPreprocessing, ShamirPrimeFieldShare, ShamirState};
 use mpc_net::Network;
 use std::sync::Arc;
-use std::{marker::PhantomData, mem::transmute};
+use std::{marker::PhantomData, mem::transmute, ops::IndexMut};
 
-use icicle_core::msm::MSM;
-
-use crate::bridges::{ArkIcicleBridge, Bn254Bridge, ark_scalars_to_device_into};
-use crate::gpu_utils::{Proof, ProofStreams, ProvingKey, VerifyingKey};
+use crate::bridges::{
+    ArkIcicleBridge, Bn254Bridge, ark_scalars_to_device_into, icicle_to_ark_scalar,
+};
+use crate::gpu_utils::{ProofStreams, ProvingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
@@ -68,7 +69,55 @@ struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScala
     eval_c: Option<DeviceVec<B::IcicleScalarField>>,
     witness_half_shares: DeviceVec<B::IcicleScalarField>,
     public_inputs: DeviceVec<B::IcicleScalarField>,
+    /// `public_inputs[1..] ++ witness_half_shares`, kept contiguous so the `a_query`,
+    /// `b_g1_query`, and `b_g2_query` MSMs can each run once over the whole instance+witness
+    /// vector instead of once for the public part and once for the private part. Refilled
+    /// (by two cheap device-to-device copies) every proof.
+    combined_scalars: DeviceVec<B::IcicleScalarField>,
+    /// Result slots for the G1 MSMs, in the order listed by [`MSM_RESULTS_G1`].
+    msm_results_g1: DeviceVec<Projective<B::IcicleG1>>,
+    /// Result slots for the G2 MSMs, in the order listed by [`MSM_RESULTS_G2`].
+    msm_results_g2: DeviceVec<Projective<B::IcicleG2>>,
+    ark_key: ArkKeyConstants<B>,
 }
+
+/// The fixed proving-key points that proof assembly needs in arkworks form.
+///
+/// Converted once when the prover is built rather than on every proof: `icicle_to_ark_g2`
+/// goes through `ark_ec::short_weierstrass::Affine::new`, whose subgroup check costs about
+/// 77 us per BN254 G2 point.
+struct ArkKeyConstants<B: ArkIcicleBridge> {
+    alpha_g1: B::ArkG1,
+    beta_g1: B::ArkG1,
+    beta_g2: B::ArkG2,
+    delta_g1: B::ArkG1,
+    delta_g2: B::ArkG2,
+    a_query_first: B::ArkG1,
+    b_g1_query_first: B::ArkG1,
+    b_g2_query_first: B::ArkG2,
+}
+
+impl<B: ArkIcicleBridge> ArkKeyConstants<B> {
+    fn new(key: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>) -> Self {
+        let g1 = |p: &Affine<B::IcicleG1>| B::ArkG1::from(B::icicle_to_ark_g1(*p));
+        let g2 = |p: &Affine<B::IcicleG2>| B::ArkG2::from(B::icicle_to_ark_g2(*p));
+        Self {
+            alpha_g1: g1(&key.vk.alpha_g1),
+            beta_g1: g1(&key.beta_g1),
+            beta_g2: g2(&key.vk.beta_g2),
+            delta_g1: g1(&key.delta_g1),
+            delta_g2: g2(&key.vk.delta_g2),
+            a_query_first: g1(&key.a_query_first),
+            b_g1_query_first: g1(&key.b_g1_query_first),
+            b_g2_query_first: g2(&key.b_g2_query_first),
+        }
+    }
+}
+
+/// The G1 MSMs of a single proof, in the order they occupy `msm_results_g1`.
+const MSM_RESULTS_G1: usize = 4;
+/// The G2 MSMs of a single proof, in the order they occupy `msm_results_g2`.
+const MSM_RESULTS_G2: usize = 1;
 
 pub type Bn254PreparedKey = ProvingKey<
     <Bn254Bridge as ArkIcicleBridge>::IcicleScalarField,
@@ -119,6 +168,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     ) -> Self {
         let alloc = |len| DeviceVec::device_malloc(len).expect("Failed to allocate device vector");
         let domain_size = prepared_key.domain_size;
+        let ark_key = ArkKeyConstants::new(&prepared_key);
         Self {
             scratch: ReductionScratch::new(domain_size, requires_eval_c),
             streams: ProofStreams::new(),
@@ -127,6 +177,14 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             eval_c: requires_eval_c.then(|| alloc(domain_size)),
             witness_half_shares: alloc(prepared_key.num_witness_variables),
             public_inputs: alloc(prepared_key.num_instance_variables),
+            combined_scalars: alloc(
+                prepared_key.num_instance_variables - 1 + prepared_key.num_witness_variables,
+            ),
+            msm_results_g1: DeviceVec::device_malloc(MSM_RESULTS_G1)
+                .expect("Failed to allocate G1 MSM result buffer"),
+            msm_results_g2: DeviceVec::device_malloc(MSM_RESULTS_G2)
+                .expect("Failed to allocate G2 MSM result buffer"),
+            ark_key,
             prepared_key,
         }
     }
@@ -145,7 +203,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         matrices: &ConstraintMatrices<B::ArkScalarField>,
         public_inputs: &[B::ArkScalarField],
         private_witness: &[U::ArithmeticShare],
-    ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+    ) -> eyre::Result<ark_groth16::Proof<B::ArkPairing>> {
         let setup_timer = std::time::Instant::now();
         let id = state.id();
         // SAFETY: matching GPU/CPU driver pairs use the same PartyID type
@@ -154,33 +212,40 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         };
         let domain_size = self.prepared_key.domain_size;
 
+        // `eval_a`/`eval_b`/`eval_c` only ever get `num_constraints` entries from the host;
+        // the domain padding beyond that is always zero, so it's zeroed here directly on
+        // the device instead of being materialized and transferred from the host.
+        T::zero_device_shares_from(&mut self.eval_a, matrices.a.len());
+        T::zero_device_shares_from(&mut self.eval_b, matrices.b.len());
+
         let eval_a = evaluate_constraint::<B::ArkPairing, U>(
             *id,
-            domain_size,
             &matrices.a,
             public_inputs,
             private_witness,
         );
-        T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a);
+        T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a, 0);
 
         let eval_b = evaluate_constraint::<B::ArkPairing, U>(
             *id,
-            domain_size,
             &matrices.b,
             public_inputs,
             private_witness,
         );
-        T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b);
+        T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b, 0);
 
         if let Some(eval_c_buf) = self.eval_c.as_mut() {
             let eval_c = evaluate_constraint_half_share::<B::ArkPairing, U>(
                 *id,
-                domain_size,
                 &matrices.c,
                 public_inputs,
                 private_witness,
             );
-            T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf);
+            eval_c_buf
+                .index_mut(eval_c.len()..)
+                .memset(0, domain_size - eval_c.len())
+                .expect("Failed to zero device buffer tail");
+            T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf, 0);
         }
 
         T::shares_to_half_share_device_into::<B, U>(private_witness, &mut self.witness_half_shares);
@@ -195,11 +260,23 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     }
 
     /// Computes the QAP witness and creates the proof from the uploaded inputs.
+    ///
+    /// Launches the MSMs that only depend on the already-uploaded public inputs and witness
+    /// shares *before* the witness-map reduction, so the GPU can work on both at once: the
+    /// MSMs run on `self.streams.g1`/`g2`, the reduction on its own (thread-local) streams,
+    /// and the host issues both without blocking in between.
     fn prove_inner<N: Network, R: R1CSToQAP>(
         &mut self,
         net: &N,
         state: &mut T::State,
-    ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
+    ) -> eyre::Result<ark_groth16::Proof<B::ArkPairing>> {
+        let msm_launch_timer = std::time::Instant::now();
+        self.launch_witness_independent_msms(state.id());
+        tracing::info!(
+            "Launching witness-independent MSMs took {} ms",
+            msm_launch_timer.elapsed().as_millis()
+        );
+
         let timer_start = std::time::Instant::now();
         R::witness_map_from_r1cs_eval::<B, T>(
             state,
@@ -217,181 +294,214 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             timer_start.elapsed().as_millis()
         );
 
+        // `h_acc`'s MSM only depends on `scratch.h` (just produced above), not on `r`/`s`,
+        // so it's launched here rather than in `finish_proof_with_assignment`: it can then
+        // run on the GPU concurrently with the (typically local, but not free) `rand` calls
+        // below instead of waiting for them first.
+        self.launch_h_msm();
+
         let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
 
-        self.create_proof_with_assignment(net, state, r, s)
+        self.finish_proof_with_assignment(net, state, r, s)
     }
 
-    fn calculate_coeff<C>(
+    /// Launches the one MSM (`h_acc`) that depends on the QAP witness `h` rather than only
+    /// on the already-uploaded public inputs and witness shares. See
+    /// [`Self::launch_witness_independent_msms`] for the other four.
+    fn launch_h_msm(&mut self) {
+        let ProvingKey { h_query, .. } = self.prepared_key.as_ref();
+        let h = &self.scratch.h;
+
+        // Result slot within `msm_results_g1`; must stay in sync with
+        // `launch_witness_independent_msms` and `finish_proof_with_assignment`'s read-back.
+        const H: usize = 3;
+
+        msm_into(
+            h_query,
+            h,
+            &mut self.msm_results_g1[H..H + 1],
+            &self.streams.g1,
+            PRECOMPUTE_FACTOR_G1,
+        );
+    }
+
+    /// Builds the combined MSM scalar buffer and launches the four MSMs that only depend on
+    /// it (i.e. not on the QAP witness `h`, which the witness map produces): `a`, `b_g1`,
+    /// `b_g2`, and `l`. Paired with [`Self::finish_proof_with_assignment`], which launches
+    /// the remaining (`h`-dependent) MSM, waits for all five, and assembles the proof.
+    fn launch_witness_independent_msms(&mut self, id: <T::State as MpcState>::PartyID) {
+        let ProvingKey {
+            a_query,
+            b_g1_query,
+            b_g2_query,
+            l_query,
+            ..
+        } = self.prepared_key.as_ref();
+
+        let stream_g1 = &self.streams.g1;
+        let stream_g2 = &self.streams.g2;
+
+        // Fill the combined scalar buffer: `public_inputs[1..] ++ witness_half_shares`
+        // (gated per-protocol on the public segment, see `write_combined_public_segment`),
+        // used by the `a`/`b_g1`/`b_g2` MSMs below instead of a separate public-only and
+        // private-only MSM each.
+        let pub_len = self.public_inputs.len() - 1;
+        {
+            let public_tail = &self.public_inputs[1..];
+            T::write_combined_public_segment(
+                id,
+                public_tail,
+                &mut self.combined_scalars[..pub_len],
+            );
+            self.combined_scalars[pub_len..]
+                .copy(&self.witness_half_shares)
+                .expect("Failed to write private segment of combined MSM scalars");
+        }
+
+        // Result slots within `msm_results_g1` / `msm_results_g2`; must stay in sync with
+        // `finish_proof_with_assignment`'s read-back.
+        const A: usize = 0;
+        const B_G1: usize = 1;
+        const L: usize = 2;
+        const B_G2: usize = 0;
+
+        msm_into(
+            a_query,
+            &self.combined_scalars,
+            &mut self.msm_results_g1[A..A + 1],
+            stream_g1,
+            PRECOMPUTE_FACTOR_G1,
+        );
+        msm_into(
+            b_g1_query,
+            &self.combined_scalars,
+            &mut self.msm_results_g1[B_G1..B_G1 + 1],
+            stream_g1,
+            PRECOMPUTE_FACTOR_G1,
+        );
+        msm_into(
+            b_g2_query,
+            &self.combined_scalars,
+            &mut self.msm_results_g2[B_G2..B_G2 + 1],
+            stream_g2,
+            PRECOMPUTE_FACTOR_G2,
+        );
+        msm_into(
+            l_query,
+            &self.witness_half_shares,
+            &mut self.msm_results_g1[L..L + 1],
+            stream_g1,
+            PRECOMPUTE_FACTOR_G1,
+        );
+    }
+
+    /// `initial + first_query + vk_param + combined_acc`, where `first_query`/`vk_param` are
+    /// public and therefore only added by the parties that may do so (see
+    /// [`CircomGroth16Prover::add_assign_point_public`]); `combined_acc` is the result of an
+    /// MSM already carrying both the public and private-witness contributions (see
+    /// [`CircomGroth16Prover::write_combined_public_segment`]) and is therefore always added.
+    ///
+    /// Stays projective throughout; the caller converts to affine once, at the end.
+    fn calculate_coeff<C: CurveGroup>(
         id: <T::State as MpcState>::PartyID,
-        initial: Affine<C>,
-        first_query: Affine<C>,
-        vk_param: Affine<C>,
-        pub_acc: Affine<C>,
-        priv_acc: Affine<C>,
-    ) -> Affine<C>
-    where
-        C: Curve<ScalarField = B::IcicleScalarField> + MSM<C>,
-    {
+        initial: C,
+        first_query: C,
+        vk_param: C,
+        combined_acc: C,
+    ) -> C {
         let mut res = initial;
-        T::add_assign_points_public_hs::<C>(id, &mut res, &first_query);
-        T::add_assign_points_public_hs::<C>(id, &mut res, &vk_param);
-        T::add_assign_points_public_hs::<C>(id, &mut res, &pub_acc);
-        (res.to_projective() + priv_acc.to_projective()).into()
+        T::add_assign_point_public::<C>(id, &mut res, &first_query);
+        T::add_assign_point_public::<C>(id, &mut res, &vk_param);
+        res + combined_acc
     }
 
-    /// Creates the proof from the QAP witness left in `self.scratch.h` by the reduction.
-    fn create_proof_with_assignment<N: Network>(
-        &self,
+    /// Waits for all five MSMs launched by [`Self::launch_witness_independent_msms`] and
+    /// [`Self::launch_h_msm`], and assembles the proof.
+    fn finish_proof_with_assignment<N: Network>(
+        &mut self,
         net: &N,
         state: &mut T::State,
         r: T::ArithmeticShare,
         s: T::ArithmeticShare,
-    ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
-        let h = &self.scratch.h;
-        let input_assignment = &self.public_inputs;
-        let aux_assignment = &self.witness_half_shares;
+    ) -> eyre::Result<ark_groth16::Proof<B::ArkPairing>> {
         let total_timer = std::time::Instant::now();
-        let ProvingKey {
-            vk,
-            beta_g1,
-            delta_g1,
-            a_query_first,
-            b_g1_query_first,
-            b_g2_query_first,
-            a_query_pub,
-            a_query_priv,
-            b_g1_query_pub,
-            b_g1_query_priv,
-            b_g2_query_pub,
-            b_g2_query_priv,
-            l_query,
-            h_query,
-            ..
-        } = self.prepared_key.as_ref();
-
-        let VerifyingKey {
-            alpha_g1,
-            beta_g2,
-            delta_g2,
-            ..
-        } = vk;
-
-        let delta_g1 = delta_g1.to_projective();
-        let delta_g2 = delta_g2.to_projective();
-
         let id = state.id();
 
         let stream_g1 = &self.streams.g1;
         let stream_g2 = &self.streams.g2;
 
         let msm_timer = std::time::Instant::now();
-        // Compute A
-        let (pub_acc_r_g1, priv_acc_r_g1) = (
-            msm_async(
-                a_query_pub,
-                &input_assignment[1..],
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-            msm_async(
-                a_query_priv,
-                aux_assignment,
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-        );
-
-        // Compute B in G1
-        let (pub_acc_s_g1, priv_acc_s_g1) = (
-            msm_async(
-                b_g1_query_pub,
-                &input_assignment[1..],
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-            msm_async(
-                b_g1_query_priv,
-                aux_assignment,
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-        );
-
-        // Compute B in G2
-        let (pub_acc_s_g2, priv_acc_s_g2) = (
-            msm_async(
-                b_g2_query_pub,
-                &input_assignment[1..],
-                stream_g2,
-                PRECOMPUTE_FACTOR_G2,
-            ),
-            msm_async(
-                b_g2_query_priv,
-                aux_assignment,
-                stream_g2,
-                PRECOMPUTE_FACTOR_G2,
-            ),
-        );
-
-        // Compute msm(l_query, aux_assignment)
-        let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
-
-        // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, h, stream_g1, PRECOMPUTE_FACTOR_G1);
-
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
         tracing::info!(
-            "MSM + stream sync took {} ms",
+            "MSM stream sync took {} ms",
             msm_timer.elapsed().as_millis()
         );
 
         let coeff_timer = std::time::Instant::now();
-        let pub_acc_r_g1 = get_first(&pub_acc_r_g1);
-        let priv_acc_r_g1 = get_first(&priv_acc_r_g1);
-        let pub_acc_s_g1 = get_first(&pub_acc_s_g1);
-        let priv_acc_s_g1 = get_first(&priv_acc_s_g1);
-        let l_acc = get_first(&l_acc);
-        let h_acc = get_first(&h_acc);
-        let pub_acc_s_g2 = get_first(&pub_acc_s_g2);
-        let priv_acc_s_g2 = get_first(&priv_acc_s_g2);
+        // One device-to-host copy per stream instead of one per MSM result.
+        let mut results_g1 = [Projective::<B::IcicleG1>::zero(); MSM_RESULTS_G1];
+        self.msm_results_g1
+            .copy_to_host(HostSlice::from_mut_slice(&mut results_g1))
+            .expect("Failed to read back G1 MSM results");
+        let mut results_g2 = [Projective::<B::IcicleG2>::zero(); MSM_RESULTS_G2];
+        self.msm_results_g2
+            .copy_to_host(HostSlice::from_mut_slice(&mut results_g2))
+            .expect("Failed to read back G2 MSM results");
 
-        let r_hs = T::to_half_share(&r);
-        let r_g1 = delta_g1 * r_hs;
-        let r_g1 = Self::calculate_coeff::<B::IcicleG1>(
+        let [acc_r_g1, acc_s_g1, l_acc, h_acc] = results_g1;
+        let [acc_s_g2] = results_g2;
+
+        // Everything below is host-side curve arithmetic, so move into arkworks (built with
+        // the `asm` feature here) rather than icicle's generic host C++ implementations, and
+        // stay in projective coordinates so only the three published points pay for the
+        // conversion to affine.
+        let msm_g1 = |p: Projective<B::IcicleG1>| -> B::ArkG1 {
+            B::ArkG1::from(B::icicle_to_ark_g1(p.into()))
+        };
+        let msm_g2 = |p: Projective<B::IcicleG2>| -> B::ArkG2 {
+            B::ArkG2::from(B::icicle_to_ark_g2(p.into()))
+        };
+        let ArkKeyConstants {
+            alpha_g1,
+            beta_g1,
+            beta_g2,
+            delta_g1,
+            delta_g2,
+            a_query_first,
+            b_g1_query_first,
+            b_g2_query_first,
+        } = self.ark_key;
+
+        let r_hs: B::ArkScalarField = icicle_to_ark_scalar(T::to_half_share(&r));
+        let g_a = Self::calculate_coeff::<B::ArkG1>(
             id,
-            r_g1.into(),
-            *a_query_first,
-            *alpha_g1,
-            pub_acc_r_g1.into(),
-            priv_acc_r_g1.into(),
+            delta_g1 * r_hs,
+            a_query_first,
+            alpha_g1,
+            msm_g1(acc_r_g1),
         );
 
         // In original implementation this is skipped if r==0, however r is shared in our case
-        let s_hs = T::to_half_share(&s);
-        let s_g1 = delta_g1 * s_hs;
-        let s_g1 = Self::calculate_coeff::<B::IcicleG1>(
+        let s_hs: B::ArkScalarField = icicle_to_ark_scalar(T::to_half_share(&s));
+        let g1_b = Self::calculate_coeff::<B::ArkG1>(
             id,
-            s_g1.into(),
-            *b_g1_query_first,
-            *beta_g1,
-            pub_acc_s_g1.into(),
-            priv_acc_s_g1.into(),
+            delta_g1 * s_hs,
+            b_g1_query_first,
+            beta_g1,
+            msm_g1(acc_s_g1),
         );
 
-        let s_g2 = delta_g2 * s_hs;
-        let s_g2 = Self::calculate_coeff::<B::IcicleG2>(
+        let g2_b = Self::calculate_coeff::<B::ArkG2>(
             id,
-            s_g2.into(),
-            *b_g2_query_first,
-            *beta_g2,
-            pub_acc_s_g2.into(),
-            priv_acc_s_g2.into(),
+            delta_g2 * s_hs,
+            b_g2_query_first,
+            beta_g2,
+            msm_g2(acc_s_g2),
         );
 
         // Compute r * s
-        let rs = T::local_mul::<B>(&r, &s, state);
+        let rs: B::ArkScalarField = icicle_to_ark_scalar(T::local_mul::<B>(&r, &s, state));
         let r_s_delta_g1 = delta_g1 * rs;
         tracing::info!(
             "Coefficient assembly took {} ms",
@@ -399,28 +509,20 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         );
 
         let open_timer = std::time::Instant::now();
-        let g_a = r_g1;
-        let g1_b = s_g1;
-
         // Opening g1_b = B*G1 is safe: B is masked by the fresh uniform s, and its exponent is
         // published in the proof as b = B*G2 anyway. With B*G1 public, r*B*G1 is a local
         // scalar multiplication, so both values can be opened in a single round.
         let (g_a_opened, g1_b_opened) = T::open_two_half_points_g1::<_, B>(g_a, g1_b, net, state)
             .expect("Failed to open g_a and g1_b");
-        let r_g1_b: Projective<<B as ArkIcicleBridge>::IcicleG1> =
-            g1_b_opened.to_projective() * r_hs;
 
-        let s_g_a: Projective<<B as ArkIcicleBridge>::IcicleG1> = g_a_opened.to_projective() * s_hs;
+        let mut g_c = g_a_opened * s_hs;
+        g_c += g1_b_opened * r_hs;
+        g_c -= r_s_delta_g1;
+        g_c += msm_g1(l_acc);
+        g_c += msm_g1(h_acc);
 
-        let mut g_c = s_g_a;
-        g_c = g_c + r_g1_b;
-        g_c = g_c - r_s_delta_g1;
-        g_c = g_c + l_acc;
-        g_c = g_c + h_acc;
-
-        let g2_b = s_g2;
         let (g_c_opened, g2_b_opened) =
-            T::open_two_half_points_g1g2::<_, B>(g_c.into(), g2_b, net, state)?;
+            T::open_two_half_points_g1g2::<_, B>(g_c, g2_b, net, state)?;
         tracing::info!(
             "Point openings took {} ms",
             open_timer.elapsed().as_millis()
@@ -430,10 +532,10 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             total_timer.elapsed().as_millis()
         );
 
-        Ok(Proof {
-            a: g_a_opened,
-            b: g2_b_opened,
-            c: g_c_opened,
+        Ok(ark_groth16::Proof {
+            a: g_a_opened.into_affine(),
+            b: g2_b_opened.into_affine(),
+            c: g_c_opened.into_affine(),
         })
     }
 }
@@ -563,7 +665,7 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Groth16Prover<P, R> {
             matrices,
             private_witness
         );
-        let icicle_proof = self
+        let proof = self
             .inner
             .prove::<_, R, co_groth16::mpc::PlainGroth16Driver>(
                 &(),
@@ -572,7 +674,7 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Groth16Prover<P, R> {
                 public_inputs,
                 witness,
             )?;
-        Ok(unsafe { cast_proof(icicle_proof.to_ark::<Bn254Bridge>()) })
+        Ok(unsafe { cast_proof(proof) })
     }
 }
 
@@ -723,7 +825,7 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Rep3CoGroth16Prover<P, R> {
 
         let mut state = Rep3State::new(net, A2BType::default())?;
 
-        let icicle_proof = self
+        let proof = self
             .inner
             .prove::<N, R, co_groth16::mpc::Rep3Groth16Driver>(
                 net,
@@ -733,20 +835,49 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Rep3CoGroth16Prover<P, R> {
                 witness,
             )?;
         // SAFETY: the constructors guarantee P == Bn254
-        Ok(unsafe { cast_proof(icicle_proof.to_ark::<Bn254Bridge>()) })
+        Ok(unsafe { cast_proof(proof) })
     }
 }
+
+/// Correlated-randomness pairs a single proof consumes (one per `rand` call).
+const SHAMIR_PAIRS_PER_PROOF: usize = 2;
 
 /// A stateful Shamir Groth16 GPU prover for the reduction `R`.
 ///
 /// The constructor allocates all GPU resources (device-resident proving key, scratch
 /// buffers, streams), so repeated [`Self::prove`] calls only pay for the
-/// witness-dependent uploads and compute.
+/// witness-dependent uploads and compute -- this part is always safe to rely on, regardless
+/// of what the other parties are running.
+///
+/// By default, [`Self::prove`] also matches upstream exactly: every call runs a fresh
+/// Shamir preprocessing (a seed-exchange round trip), the same as
+/// `co_groth16::ShamirCoGroth16::prove`, so this prover's network behavior never depends on
+/// its own call history and stays compatible with *any* co-party, including one running the
+/// plain upstream reference implementation.
+///
+/// Call [`Self::preprocess`] (or [`Self::enable_persistent_shamir_state`]) to opt into
+/// keeping the Shamir MPC state across proofs instead, so only the first proof pays for the
+/// seed-exchange round trip. **This changes how many network messages a `prove` call
+/// exchanges, which is only safe if every other party in the computation makes the exact
+/// same change at the exact same time** -- e.g. if every party is running this same
+/// persistent-prover pattern. Enabling it on this party alone while co-parties keep calling
+/// a one-shot API (including upstream's `co_groth16::ShamirCoGroth16::prove`) desyncs the
+/// network the moment this party's second `prove` call skips a preprocessing round its
+/// co-parties still perform: the resulting misaligned messages get deserialized as the wrong
+/// type, surfacing as spurious `ark_serialize` "invalid data" errors deep in an unrelated
+/// opening call, not as an error at the point of misuse.
 ///
 /// Currently only supports BN254.
 pub struct ShamirCoGroth16Prover<P, R = CircomReduction> {
     num_parties: usize,
     threshold: usize,
+    /// `Some` only once [`Self::preprocess`]/[`Self::enable_persistent_shamir_state`] has been
+    /// called; until then every [`Self::prove`] call preprocesses fresh and discards the
+    /// result, matching upstream's one-shot behavior exactly.
+    state: Option<ShamirState<ark_bn254::Fr>>,
+    /// Set once persistence is requested; see the struct docs for the symmetry requirement
+    /// this implies.
+    persist_shamir_state: bool,
     inner: CoGroth16Icicle<Bn254Bridge, ShamirGroth16Driver<ark_bn254::Fr>>,
     phantom_data: PhantomData<(P, R)>,
 }
@@ -765,9 +896,42 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> ShamirCoGroth16Prover<P, R> {
         Self {
             num_parties,
             threshold,
+            state: None,
+            persist_shamir_state: false,
             inner: CoGroth16Icicle::new(prepared_key, R::requires_eval_c()),
             phantom_data: PhantomData,
         }
+    }
+
+    /// Opts into keeping the Shamir MPC state across [`Self::prove`] calls, without
+    /// preprocessing anything yet (that happens lazily, on the next `prove`).
+    ///
+    /// See the struct docs: every other party in the computation must make the same change,
+    /// at the same time, or the network desyncs.
+    pub fn enable_persistent_shamir_state(&mut self) {
+        self.persist_shamir_state = true;
+    }
+
+    /// Opts into persistent Shamir state (see [`Self::enable_persistent_shamir_state`]) and
+    /// preprocesses enough correlated randomness for `num_proofs` proofs ahead of time, so
+    /// the (one-time) seed-exchange round trip happens now rather than on the next `prove`.
+    ///
+    /// Calling this is optional even once persistence is enabled -- `prove` preprocesses on
+    /// demand -- but doing it ahead of time keeps the setup off the critical path. Topping up
+    /// the randomness on top of an already-established state needs no communication at all
+    /// in the 3-party case, so a prover that is reused never pays for that round trip again.
+    pub fn preprocess<N: Network>(&mut self, net: &N, num_proofs: usize) -> Result<()> {
+        self.persist_shamir_state = true;
+        let pairs = num_proofs.saturating_mul(SHAMIR_PAIRS_PER_PROOF);
+        match self.state.as_mut() {
+            Some(state) => state.buffer_triples(net, pairs)?,
+            None => {
+                let preprocessing =
+                    ShamirPreprocessing::new(self.num_parties, self.threshold, pairs, net)?;
+                self.state = Some(ShamirState::from(preprocessing));
+            }
+        }
+        Ok(())
     }
 
     /// Prepares the proving key on the device and creates a prover.
@@ -810,22 +974,84 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> ShamirCoGroth16Prover<P, R> {
             private_witness
         );
 
-        // we need 2 corr rand pairs for the two rand calls
-        let num_pairs = 2;
-        let preprocessing =
-            ShamirPreprocessing::new(self.num_parties, self.threshold, num_pairs, net)?;
-        let mut state = ShamirState::from(preprocessing);
+        // Safe default: a fresh preprocessing (and hence seed-exchange round trip) every
+        // call, discarded afterwards, exactly matching upstream's one-shot behavior -- see
+        // the struct docs for why this must stay the default.
+        if !self.persist_shamir_state {
+            let preprocessing = ShamirPreprocessing::new(
+                self.num_parties,
+                self.threshold,
+                SHAMIR_PAIRS_PER_PROOF,
+                net,
+            )?;
+            let mut state = ShamirState::from(preprocessing);
+            let proof = self
+                .inner
+                .prove::<N, R, co_groth16::mpc::ShamirGroth16Driver>(
+                    net,
+                    &mut state,
+                    matrices,
+                    public_inputs,
+                    witness,
+                )?;
+            // SAFETY: the constructors guarantee P == Bn254
+            return Ok(unsafe { cast_proof(proof) });
+        }
 
-        let icicle_proof = self
+        // Opted in via `enable_persistent_shamir_state`/`preprocess`: reuse the state built
+        // by an earlier proof when there is one, so only the first proof pays for the seed
+        // exchange.
+        self.preprocess(net, 1)?;
+        let state = self
+            .state
+            .as_mut()
+            .expect("preprocess installs the Shamir state");
+
+        let proof = self
             .inner
             .prove::<N, R, co_groth16::mpc::ShamirGroth16Driver>(
                 net,
-                &mut state,
+                state,
                 matrices,
                 public_inputs,
                 witness,
             )?;
         // SAFETY: the constructors guarantee P == Bn254
-        Ok(unsafe { cast_proof(icicle_proof.to_ark::<Bn254Bridge>()) })
+        Ok(unsafe { cast_proof(proof) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ark_ec::VariableBaseMSM;
+    use ark_ff::UniformRand;
+    use rand::thread_rng;
+
+    /// Sanity check for the load-bearing identity behind merging the public and
+    /// private-witness MSMs into one (`create_proof_with_assignment`'s `combined_scalars`):
+    /// MSM is linear, so splitting the bases/scalars anywhere and computing two separate
+    /// MSMs then summing them must equal one MSM over the concatenation. This doesn't
+    /// exercise icicle's actual MSM/precompute machinery (no GPU here), but it does verify
+    /// the algebraic claim the optimization depends on, independent of any of this crate's
+    /// device code.
+    #[test]
+    fn msm_is_linear_in_split_point() {
+        let mut rng = thread_rng();
+        let n_pub = 37;
+        let n_priv = 101;
+
+        let scalars = (0..n_pub + n_priv)
+            .map(|_| ark_bn254::Fr::rand(&mut rng))
+            .collect::<Vec<_>>();
+        let bases = (0..n_pub + n_priv)
+            .map(|_| ark_bn254::G1Projective::rand(&mut rng).into())
+            .collect::<Vec<ark_bn254::G1Affine>>();
+
+        let combined = ark_bn254::G1Projective::msm(&bases, &scalars).unwrap();
+
+        let split = ark_bn254::G1Projective::msm(&bases[..n_pub], &scalars[..n_pub]).unwrap()
+            + ark_bn254::G1Projective::msm(&bases[n_pub..], &scalars[n_pub..]).unwrap();
+
+        assert_eq!(combined, split);
     }
 }

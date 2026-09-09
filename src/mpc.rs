@@ -3,7 +3,7 @@ pub(crate) mod rep3;
 pub(crate) mod shamir;
 
 use icicle_core::{
-    curve::{Affine, Curve},
+    curve::Curve,
     ntt::NTT,
     traits::{Arithmetic, FieldImpl, MontgomeryConvertible},
     vec_ops::{VecOps, VecOpsConfig, mul_scalars},
@@ -38,11 +38,49 @@ pub trait CircomGroth16Prover<
     /// Internal state of used MPC protocol
     type State: MpcState + Send;
 
-    /// Elementwise transformation of a vector of public values into a vector of shared values: \[a_i\] = a_i.
-    fn promote_to_trivial_shares(
+    /// Writes the trivial sharing of the public `public_values` into
+    /// `dst[start..start + public_values.len()]`: \[a_i\] = a_i.
+    ///
+    /// Writes straight into the destination rather than returning a fresh buffer: on the
+    /// CUDA backend both `icicle_malloc` and the matching `icicle_free` synchronize the
+    /// whole device, so a per-proof allocation here would also stall any stream running
+    /// concurrently with the witness map.
+    fn write_trivial_shares_into(
         id: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
-    ) -> Self::DeviceShares;
+        dst: &mut Self::DeviceShares,
+        start: usize,
+    );
+
+    /// Zeroes `dst[from..]`.
+    ///
+    /// Used to clear the domain padding of the constraint-evaluation buffers, which is
+    /// always zero, without transferring it from the host: the host only computes
+    /// `num_constraints`-length vectors (see [`crate::utils::evaluate_constraint`]), and the
+    /// tail is zeroed here instead, then partly overwritten by
+    /// [`Self::write_trivial_shares_into`].
+    fn zero_device_shares_from(dst: &mut Self::DeviceShares, from: usize);
+
+    /// Writes the public-input segment of the combined `a`/`b_g1`/`b_g2`-query MSM scalar
+    /// buffer (see [`crate::groth16_gpu`]'s `combined_scalars`): the segment corresponding
+    /// to `query[1..num_instance_variables]`, i.e. the actual public inputs.
+    ///
+    /// Merging the public and private-witness MSMs into one only works if the public
+    /// contribution is still added exactly once across all parties once reconstructed, and
+    /// how to achieve that is protocol-specific:
+    /// - Rep3 reconstructs by a plain, unweighted sum of every party's share, so only one
+    ///   party (`PartyID::ID0`, matching [`Self::add_assign_point_public`]'s gating) may
+    ///   write the real public values; every other party must write zero, or the public
+    ///   contribution would be counted once per party.
+    /// - Shamir reconstructs via Lagrange weights that sum to 1, so writing the same public
+    ///   values at every party is already correct (a constant added to every share of a
+    ///   polynomial shifts its evaluation-at-0 by exactly that constant).
+    /// - Plain has only one party, so there is nothing to gate.
+    fn write_combined_public_segment(
+        id: <Self::State as MpcState>::PartyID,
+        public_values: &DeviceSlice<F>,
+        dst: &mut DeviceSlice<F>,
+    );
 
     /// Computes the \[coeffs_i\] *= c * g^i for the coefficients in 0 <= i < coeff.len()
     fn distribute_powers_and_mul_by_const(
@@ -69,11 +107,16 @@ pub trait CircomGroth16Prover<
     /// Converts a shared value to a half shared value. Local interaction only.
     fn to_half_share(a: &Self::ArithmeticShare) -> F;
 
-    /// Add a public point B in place to the shared point A
-    fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
+    /// Adds the public point `point` into the shared point accumulator `acc`.
+    ///
+    /// Takes arkworks points: everything after the MSMs is host-side curve arithmetic, and
+    /// icicle's host implementations are generic C++ while `ark-ff` is built with `asm`
+    /// here. Working in projective coordinates also keeps the conversion to affine (a field
+    /// inversion each) to just the points that end up in the proof.
+    fn add_assign_point_public<C: ark_ec::CurveGroup>(
         _: <Self::State as MpcState>::PartyID,
-        a: &mut Affine<C>,
-        b: &Affine<C>,
+        acc: &mut C,
+        point: &C,
     );
 
     /// Performs the Fast Fourier Transform (FFT) in place.
@@ -82,36 +125,29 @@ pub trait CircomGroth16Prover<
     /// Performs the Inverse Fast Fourier Transform (IFFT) in place.
     fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>);
 
-    /// Copies a slice of device shares to another device shares vector,
-    /// starting and ending at the specified indices.
-    fn copy_to_device_shares(
-        src: &Self::DeviceShares,
-        dst: &mut Self::DeviceShares,
-        start: usize,
-        end: usize,
-    );
-
     // ICICLE <-> ARK functions
 
     /// Allocates an (uninitialized) vector of device shares of the given length.
     fn alloc_device_shares(len: usize) -> Self::DeviceShares;
 
-    /// Uploads a vector of arithmetic shares into the pre-allocated device shares.
+    /// Uploads a vector of arithmetic shares into `dst` at the given offset.
     fn shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut Self::DeviceShares,
+        start: usize,
     );
 
-    /// Uploads a vector of arithmetic half shares into the pre-allocated device vector.
+    /// Uploads a vector of arithmetic half shares into `dst` at the given offset.
     fn half_shares_to_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticHalfShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     );
 
     /// Uploads the half-share component of a vector of arithmetic shares into the
@@ -158,20 +194,20 @@ pub trait CircomGroth16Prover<
     /// Reconstructs two shared points in G1 in a single communication round:
     /// (A, B) = (Open(\[A\]), Open(\[B\])).
     fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG1>,
-        b: Affine<B::IcicleG1>,
+        a: B::ArkG1,
+        b: B::ArkG1,
         net: &N,
         state: &mut Self::State,
-    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)>;
+    ) -> eyre::Result<(B::ArkG1, B::ArkG1)>;
 
     /// Reconstructs a shared point in G1 together with a shared point in G2 in a single
     /// communication round: (A, B) = (Open(\[A\]), Open(\[B\])).
     fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG1>,
-        b: Affine<B::IcicleG2>,
+        a: B::ArkG1,
+        b: B::ArkG2,
         net: &N,
         state: &mut Self::State,
-    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)>;
+    ) -> eyre::Result<(B::ArkG1, B::ArkG2)>;
 
     fn open_device_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         shares: &Self::DeviceShares,

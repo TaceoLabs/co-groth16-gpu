@@ -17,7 +17,7 @@ use std::{mem::transmute, ops::IndexMut};
 
 use crate::{
     bridges::{
-        ArkIcicleBridge, ark_scalars_to_device_into, ark_to_icicle_scalar, icicle_to_ark_scalar,
+        ArkIcicleBridge, ark_scalars_to_device_into_at, ark_to_icicle_scalar, icicle_to_ark_scalar,
     },
     gpu_utils::{fft_inplace, ifft_inplace, to_host_vec_icicle_scalar},
 };
@@ -40,14 +40,31 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         *a
     }
 
-    fn promote_to_trivial_shares(
+    fn write_trivial_shares_into(
         _: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
-    ) -> Self::DeviceShares {
-        let mut result = DeviceVec::device_malloc(public_values.len())
-            .expect("Failed to allocate device vector");
-        result.copy(public_values).unwrap();
-        result
+        dst: &mut Self::DeviceShares,
+        start: usize,
+    ) {
+        dst.index_mut(start..start + public_values.len())
+            .copy(public_values)
+            .expect("Failed to write trivial shares into device buffer");
+    }
+
+    fn zero_device_shares_from(dst: &mut Self::DeviceShares, from: usize) {
+        let len = dst.len() - from;
+        dst.index_mut(from..)
+            .memset(0, len)
+            .expect("Failed to zero device buffer tail");
+    }
+
+    fn write_combined_public_segment(
+        _: <Self::State as MpcState>::PartyID,
+        public_values: &DeviceSlice<F>,
+        dst: &mut DeviceSlice<F>,
+    ) {
+        dst.copy(public_values)
+            .expect("Failed to write public segment of combined MSM scalars");
     }
 
     fn distribute_powers_and_mul_by_const(
@@ -64,12 +81,12 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         mul_scalars(coeffs_in, roots, coeffs.as_mut_slice(), &cfg).unwrap();
     }
 
-    fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
+    fn add_assign_point_public<C: ark_ec::CurveGroup>(
         _: <Self::State as MpcState>::PartyID,
-        a: &mut Affine<C>,
-        b: &Affine<C>,
+        acc: &mut C,
+        point: &C,
     ) {
-        *a = (a.to_projective() + b.to_projective()).into();
+        *acc += point;
     }
 
     fn fft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
@@ -78,15 +95,6 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
     fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
         ifft_inplace(input, stream, coset_gen);
-    }
-
-    fn copy_to_device_shares(
-        src: &Self::DeviceShares,
-        dst: &mut Self::DeviceShares,
-        start: usize,
-        end: usize,
-    ) {
-        dst.index_mut(start..end).copy(src).unwrap();
     }
 
     fn alloc_device_shares(len: usize) -> Self::DeviceShares {
@@ -99,6 +107,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut Self::DeviceShares,
+        start: usize,
     ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
@@ -108,7 +117,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // SAFETY: At this point we know the shares are safe to transmute
         let shares = unsafe { transmute::<&[T::ArithmeticShare], &[B::ArkScalarField]>(shares) };
-        ark_scalars_to_device_into(shares, dst);
+        ark_scalars_to_device_into_at(shares, dst, start);
     }
 
     fn half_shares_to_device_into<
@@ -117,6 +126,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     >(
         shares: &[T::ArithmeticHalfShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
@@ -127,7 +137,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
             unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
-        ark_scalars_to_device_into(shares, dst);
+        ark_scalars_to_device_into_at(shares, dst, start);
     }
 
     fn shares_to_half_share_device_into<
@@ -138,7 +148,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         dst: &mut DeviceVec<F>,
     ) {
         // A plain share already *is* its half share, so there's nothing to convert.
-        Self::shares_to_device_into::<B, T>(shares, dst);
+        Self::shares_to_device_into::<B, T>(shares, dst, 0);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
@@ -176,20 +186,20 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     }
 
     fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG1>,
-        b: Affine<B::IcicleG1>,
+        a: B::ArkG1,
+        b: B::ArkG1,
         _: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)> {
+    ) -> eyre::Result<(B::ArkG1, B::ArkG1)> {
         Ok((a, b))
     }
 
     fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG1>,
-        b: Affine<B::IcicleG2>,
+        a: B::ArkG1,
+        b: B::ArkG2,
         _: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)> {
+    ) -> eyre::Result<(B::ArkG1, B::ArkG2)> {
         Ok((a, b))
     }
 

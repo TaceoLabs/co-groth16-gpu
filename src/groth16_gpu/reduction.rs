@@ -51,10 +51,13 @@ thread_local! {
 pub struct ReductionScratch<F> {
     /// Only used by [`CircomReduction`] (i.e. when `requires_eval_c` is false).
     c: Option<DeviceVec<F>>,
-    /// Only used by [`LibSnarkReduction`] (i.e. when `requires_eval_c` is true).
+    /// Only used by [`LibSnarkReduction`] (i.e. when `requires_eval_c` is true). Doubles as
+    /// the `a*b` scratch for that reduction (see [`LibSnarkReduction`]'s impl), so no
+    /// separate `ab` buffer is needed.
     sub: Option<DeviceVec<F>>,
-    ab: DeviceVec<F>,
-    /// Holds the QAP witness `h` after [`R1CSToQAP::witness_map_from_r1cs_eval`].
+    /// Holds the QAP witness `h` after [`R1CSToQAP::witness_map_from_r1cs_eval`]. For
+    /// [`CircomReduction`], also doubles as the `a*b` scratch before the final subtraction
+    /// turns it into `h` in place.
     pub(crate) h: DeviceVec<F>,
 }
 
@@ -65,7 +68,6 @@ impl<F> ReductionScratch<F> {
         Self {
             c: (!requires_eval_c).then(alloc),
             sub: requires_eval_c.then(alloc),
-            ab: alloc(),
             h: alloc(),
         }
     }
@@ -119,7 +121,7 @@ impl R1CSToQAP for CircomReduction {
         public_inputs: &DeviceSlice<B::IcicleScalarField>,
         roots_to_power_domain: &DeviceSlice<B::IcicleScalarField>,
         num_constraints: usize,
-        domain_size: usize,
+        _domain_size: usize,
         scratch: &mut ReductionScratch<B::IcicleScalarField>,
     ) -> Result<()> {
         assert!(eval_c.is_none());
@@ -127,8 +129,7 @@ impl R1CSToQAP for CircomReduction {
         let id = state.id();
 
         // Computation of a
-        let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
-        T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
+        T::write_trivial_shares_into(id, public_inputs, eval_a, num_constraints);
 
         REDUCTION_STREAMS.with(|streams| {
             let mut streams = streams.borrow_mut();
@@ -158,17 +159,20 @@ impl R1CSToQAP for CircomReduction {
 
             stream_b.synchronize().unwrap();
 
-            let ab = &mut scratch.ab;
-            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, ab);
-
-            stream_a.synchronize().unwrap();
-
+            // `local_mul_vec` writes a*b straight into `h` (its eventual home) and already
+            // synchronizes `stream_a` internally, so there's nothing left to wait on here.
             let h = &mut scratch.h;
+            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, h);
 
+            // h := h - c, in place. Safe for the same reason `distribute_powers_and_mul_by_const`
+            // aliases its input and output: `sub_scalars` is elementwise, so output[i] only
+            // ever depends on input[i].
+            let h_in: &DeviceSlice<B::IcicleScalarField> =
+                unsafe { &*(&**h as *const DeviceSlice<B::IcicleScalarField>) };
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
             cfg.is_async = true;
-            sub_scalars(&*ab, &*c, h.as_mut_slice(), &cfg).unwrap();
+            sub_scalars(h_in, &*c, h.as_mut_slice(), &cfg).unwrap();
 
             stream_c.synchronize().unwrap();
         });
@@ -212,8 +216,7 @@ impl R1CSToQAP for LibSnarkReduction {
         let coset_gen = Some(ark_to_icicle_scalar(B::ArkScalarField::GENERATOR));
 
         // Computation of a
-        let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
-        T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
+        T::write_trivial_shares_into(id, public_inputs, eval_a, num_constraints);
 
         // TODO
         let vanishing_polynomial_over_coset =
@@ -246,21 +249,23 @@ impl R1CSToQAP for LibSnarkReduction {
 
             stream_b.synchronize().unwrap();
 
-            let ab = &mut scratch.ab;
-            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, ab);
-
-            stream_a.synchronize().unwrap();
-
+            // `local_mul_vec` writes a*b straight into `sub` (reused below as the a*b - c
+            // scratch) and already synchronizes `stream_a` internally.
             let sub = scratch
                 .sub
                 .as_mut()
                 .expect("allocated for LibSnarkReduction");
+            T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, sub);
+
             let h = &mut scratch.h;
 
+            // sub := sub - c, in place; same elementwise-aliasing argument as above.
+            let sub_in: &DeviceSlice<B::IcicleScalarField> =
+                unsafe { &*(&**sub as *const DeviceSlice<B::IcicleScalarField>) };
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
             cfg.is_async = true;
-            sub_scalars(&*ab, c, sub.as_mut_slice(), &cfg).unwrap();
+            sub_scalars(sub_in, c, sub.as_mut_slice(), &cfg).unwrap();
             scalar_mul(
                 HostSlice::from_slice(&vanishing_polynomial_over_coset),
                 &*sub,

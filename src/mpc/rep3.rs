@@ -1,6 +1,5 @@
 use std::{mem::transmute, ops::IndexMut};
 
-use ark_ec::CurveGroup;
 use icicle_core::{
     curve::{Affine, Curve},
     ntt::NTT,
@@ -20,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::{
     bridges::{
-        ArkIcicleBridge, ark_scalars_to_device_into, ark_to_icicle_affine, ark_to_icicle_scalar,
+        ArkIcicleBridge, ark_scalars_to_device_into_at, ark_to_icicle_scalar,
         ark_to_icicle_scalars, icicle_to_ark_scalar,
     },
     gpu_utils::{fft_inplace, from_host_slice, ifft_inplace, to_host_vec_icicle_scalar},
@@ -55,31 +54,59 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         a.a
     }
 
-    fn promote_to_trivial_shares(
+    fn write_trivial_shares_into(
         id: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
-    ) -> Self::DeviceShares {
-        let mut a = DeviceVec::device_malloc(public_values.len())
-            .expect("Failed to allocate device vector");
-        let mut b = DeviceVec::device_malloc(public_values.len())
-            .expect("Failed to allocate device vector");
+        dst: &mut Self::DeviceShares,
+        start: usize,
+    ) {
+        let len = public_values.len();
+        let range = start..start + len;
+        let a = dst.a.index_mut(range.clone());
+        let b = dst.b.index_mut(range);
 
         match id {
             PartyID::ID0 => {
                 a.copy(public_values).unwrap();
-                b.memset(0, public_values.len()).unwrap();
+                b.memset(0, len).unwrap();
             }
             PartyID::ID1 => {
-                a.memset(0, public_values.len()).unwrap();
+                a.memset(0, len).unwrap();
                 b.copy(public_values).unwrap();
             }
             PartyID::ID2 => {
-                a.memset(0, public_values.len()).unwrap();
-                b.memset(0, public_values.len()).unwrap();
+                a.memset(0, len).unwrap();
+                b.memset(0, len).unwrap();
             }
         }
+    }
 
-        Self::DeviceShares { a, b }
+    fn zero_device_shares_from(dst: &mut Self::DeviceShares, from: usize) {
+        let len = dst.a.len() - from;
+        dst.a
+            .index_mut(from..)
+            .memset(0, len)
+            .expect("Failed to zero device buffer tail");
+        dst.b
+            .index_mut(from..)
+            .memset(0, len)
+            .expect("Failed to zero device buffer tail");
+    }
+
+    fn write_combined_public_segment(
+        id: <Self::State as MpcState>::PartyID,
+        public_values: &DeviceSlice<F>,
+        dst: &mut DeviceSlice<F>,
+    ) {
+        // Only one party may contribute the real values -- see the trait docs and
+        // `add_assign_point_public`, which is gated the same way for the same reason.
+        if matches!(id, PartyID::ID0) {
+            dst.copy(public_values)
+                .expect("Failed to write public segment of combined MSM scalars");
+        } else {
+            dst.memset(0, public_values.len())
+                .expect("Failed to zero public segment of combined MSM scalars");
+        }
     }
 
     fn distribute_powers_and_mul_by_const(
@@ -99,13 +126,14 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         mul_scalars(b_in, roots, coeffs.b.as_mut_slice(), &cfg).unwrap();
     }
 
-    fn add_assign_points_public_hs<C: Curve<ScalarField = F>>(
+    fn add_assign_point_public<C: ark_ec::CurveGroup>(
         id: <Self::State as MpcState>::PartyID,
-        a: &mut Affine<C>,
-        b: &Affine<C>,
+        acc: &mut C,
+        point: &C,
     ) {
+        // The shares are additive, so exactly one party may add the public part.
         if matches!(id, PartyID::ID0) {
-            *a = (a.to_projective() + b.to_projective()).into();
+            *acc += point;
         }
     }
 
@@ -117,16 +145,6 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
         ifft_inplace(&mut input.a, stream, coset_gen);
         ifft_inplace(&mut input.b, stream, coset_gen);
-    }
-
-    fn copy_to_device_shares(
-        src: &Self::DeviceShares,
-        dst: &mut Self::DeviceShares,
-        start: usize,
-        end: usize,
-    ) {
-        dst.a.index_mut(start..end).copy(&src.a).unwrap();
-        dst.b.index_mut(start..end).copy(&src.b).unwrap();
     }
 
     fn alloc_device_shares(len: usize) -> Self::DeviceShares {
@@ -142,6 +160,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut Self::DeviceShares,
+        start: usize,
     ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -157,8 +176,8 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         let (shares_a, shares_b): (Vec<B::ArkScalarField>, Vec<B::ArkScalarField>) =
             shares.iter().map(|s| (s.a, s.b)).unzip();
 
-        ark_scalars_to_device_into(&shares_a, &mut dst.a);
-        ark_scalars_to_device_into(&shares_b, &mut dst.b);
+        ark_scalars_to_device_into_at(&shares_a, &mut dst.a, start);
+        ark_scalars_to_device_into_at(&shares_b, &mut dst.b, start);
     }
 
     fn half_shares_to_device_into<
@@ -167,6 +186,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     >(
         shares: &[T::ArithmeticHalfShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -177,7 +197,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         // SAFETY: At this point we know the shares are safe to transmute
         let shares =
             unsafe { transmute::<&[T::ArithmeticHalfShare], &[B::ArkScalarField]>(shares) };
-        ark_scalars_to_device_into(shares, dst);
+        ark_scalars_to_device_into_at(shares, dst, start);
     }
 
     fn shares_to_half_share_device_into<
@@ -200,7 +220,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // Only the `a` component is a half share; the `b` component never reaches the device.
         let shares_a = shares.iter().map(|s| s.a).collect::<Vec<_>>();
-        ark_scalars_to_device_into(&shares_a, dst);
+        ark_scalars_to_device_into_at(&shares_a, dst, 0);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
@@ -262,33 +282,21 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     }
 
     fn open_two_half_points_g1<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG1>,
-        b: Affine<B::IcicleG1>,
+        a: B::ArkG1,
+        b: B::ArkG1,
         net: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG1>)> {
-        let ark_a = B::icicle_to_ark_g1(a);
-        let ark_b = B::icicle_to_ark_g1(b);
-        let (open_a, open_b) = pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net)?;
-        Ok((
-            ark_to_icicle_affine(&open_a.into_affine()),
-            ark_to_icicle_affine(&open_b.into_affine()),
-        ))
+    ) -> eyre::Result<(B::ArkG1, B::ArkG1)> {
+        pointshare::open_two_half_points(a, b, net)
     }
 
     fn open_two_half_points_g1g2<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
-        a: Affine<B::IcicleG1>,
-        b: Affine<B::IcicleG2>,
+        a: B::ArkG1,
+        b: B::ArkG2,
         net: &N,
         _: &mut Self::State,
-    ) -> eyre::Result<(Affine<B::IcicleG1>, Affine<B::IcicleG2>)> {
-        let ark_a = B::icicle_to_ark_g1(a);
-        let ark_b = B::icicle_to_ark_g2(b);
-        let (open_a, open_b) = pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net)?;
-        Ok((
-            ark_to_icicle_affine(&open_a.into_affine()),
-            ark_to_icicle_affine(&open_b.into_affine()),
-        ))
+    ) -> eyre::Result<(B::ArkG1, B::ArkG2)> {
+        pointshare::open_two_half_points(a, b, net)
     }
 
     // TODO CESAR: remove

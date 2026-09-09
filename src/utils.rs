@@ -60,40 +60,39 @@ pub(crate) fn root_of_unity_for_groth16<F: PrimeField + FftField>(
     }
 }
 
+/// Evaluates every constraint row, returning exactly `matrix.len()` (i.e. `num_constraints`)
+/// entries -- no padding to the domain size. The domain padding is always zero and is
+/// applied on the device instead (see [`crate::mpc::CircomGroth16Prover::zero_device_shares_from`]),
+/// so the host never allocates, fills, or uploads it.
 pub(crate) fn evaluate_constraint<
     P: ark_ec::pairing::Pairing,
     T: co_groth16::CircomGroth16Prover<P>,
 >(
     id: <T::State as MpcState>::PartyID,
-    domain_size: usize,
     matrix: &Matrix<P::ScalarField>,
     public_inputs: &[P::ScalarField],
     private_witness: &[T::ArithmeticShare],
 ) -> Vec<T::ArithmeticShare> {
-    let mut result = matrix
+    matrix
         .par_iter()
         .with_min_len(256)
         .map(|x| T::evaluate_constraint(id, x, public_inputs, private_witness))
-        .collect::<Vec<_>>();
-    result.resize(domain_size, T::ArithmeticShare::default());
-    result
+        .collect::<Vec<_>>()
 }
 
+/// See [`evaluate_constraint`]: same deal, no domain padding.
 pub fn evaluate_constraint_half_share<
     P: ark_ec::pairing::Pairing,
     T: co_groth16::CircomGroth16Prover<P>,
 >(
     id: <T::State as MpcState>::PartyID,
-    domain_size: usize,
     matrix: &Matrix<P::ScalarField>,
     public_inputs: &[P::ScalarField],
     private_witness: &[T::ArithmeticShare],
 ) -> Vec<T::ArithmeticHalfShare> {
-    let mut result = matrix
+    matrix
         .par_iter()
         .with_min_len(256)
         .map(|x| T::evaluate_constraint_half_share(id, x, public_inputs, private_witness))
-        .collect::<Vec<_>>();
-    result.resize(domain_size, T::ArithmeticHalfShare::default());
-    result
+        .collect::<Vec<_>>()
 }
