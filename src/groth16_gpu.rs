@@ -67,12 +67,13 @@ struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScala
     eval_b: T::DeviceShares,
     /// Only allocated when the reduction requires the evaluation of the `C` matrix.
     eval_c: Option<DeviceVec<B::IcicleScalarField>>,
-    witness_half_shares: DeviceVec<B::IcicleScalarField>,
     public_inputs: DeviceVec<B::IcicleScalarField>,
-    /// `public_inputs[1..] ++ witness_half_shares`, kept contiguous so the `a_query`,
-    /// `b_g1_query`, and `b_g2_query` MSMs can each run once over the whole instance+witness
-    /// vector instead of once for the public part and once for the private part. Refilled
-    /// (by two cheap device-to-device copies) every proof.
+    /// `public_inputs[1..] ++ private_witness_half_shares`, kept contiguous so the
+    /// `a_query`, `b_g1_query`, and `b_g2_query` MSMs can each run once over the whole
+    /// instance+witness vector instead of once for the public part and once for the private
+    /// part; the `l_query` MSM also reads its `[pub_len..]` tail directly. The private
+    /// segment is uploaded straight into this buffer (see `prove`), so it only needs one
+    /// device write per proof, not a separate upload-then-copy.
     combined_scalars: DeviceVec<B::IcicleScalarField>,
     /// Result slots for the G1 MSMs, in the order listed by [`MSM_RESULTS_G1`].
     msm_results_g1: DeviceVec<Projective<B::IcicleG1>>,
@@ -118,6 +119,16 @@ impl<B: ArkIcicleBridge> ArkKeyConstants<B> {
 const MSM_RESULTS_G1: usize = 4;
 /// The G2 MSMs of a single proof, in the order they occupy `msm_results_g2`.
 const MSM_RESULTS_G2: usize = 1;
+
+/// Slot indices within `msm_results_g1`/`msm_results_g2`. Shared by
+/// `CoGroth16Icicle::launch_h_msm` and `launch_witness_independent_msms` (which write into
+/// these slots) and `finish_proof_with_assignment` (which reads them back), so the mapping
+/// only needs to be edited in one place.
+const MSM_SLOT_A: usize = 0;
+const MSM_SLOT_B_G1: usize = 1;
+const MSM_SLOT_L: usize = 2;
+const MSM_SLOT_H: usize = 3;
+const MSM_SLOT_B_G2: usize = 0;
 
 pub type Bn254PreparedKey = ProvingKey<
     <Bn254Bridge as ArkIcicleBridge>::IcicleScalarField,
@@ -169,13 +180,29 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let alloc = |len| DeviceVec::device_malloc(len).expect("Failed to allocate device vector");
         let domain_size = prepared_key.domain_size;
         let ark_key = ArkKeyConstants::new(&prepared_key);
+
+        // `eval_a`/`eval_b`/`eval_c` only ever get `num_constraints` entries from the host on
+        // each `prove` call; the domain padding beyond that is always zero and, since
+        // `num_constraints` is fixed for the lifetime of this prover (one instance per
+        // circuit), only needs zeroing once here rather than on every proof.
+        let mut eval_a = T::alloc_device_shares(domain_size);
+        let mut eval_b = T::alloc_device_shares(domain_size);
+        T::zero_device_shares_from(&mut eval_a, prepared_key.num_constraints);
+        T::zero_device_shares_from(&mut eval_b, prepared_key.num_constraints);
+        let mut eval_c = requires_eval_c.then(|| alloc(domain_size));
+        if let Some(eval_c_buf) = eval_c.as_mut() {
+            eval_c_buf
+                .index_mut(prepared_key.num_constraints..)
+                .memset(0, domain_size - prepared_key.num_constraints)
+                .expect("Failed to zero device buffer tail");
+        }
+
         Self {
             scratch: ReductionScratch::new(domain_size, requires_eval_c),
             streams: ProofStreams::new(),
-            eval_a: T::alloc_device_shares(domain_size),
-            eval_b: T::alloc_device_shares(domain_size),
-            eval_c: requires_eval_c.then(|| alloc(domain_size)),
-            witness_half_shares: alloc(prepared_key.num_witness_variables),
+            eval_a,
+            eval_b,
+            eval_c,
             public_inputs: alloc(prepared_key.num_instance_variables),
             combined_scalars: alloc(
                 prepared_key.num_instance_variables - 1 + prepared_key.num_witness_variables,
@@ -210,14 +237,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let id = unsafe {
             transmute::<&<T::State as MpcState>::PartyID, &<U::State as MpcState>::PartyID>(&id)
         };
-        let domain_size = self.prepared_key.domain_size;
-
-        // `eval_a`/`eval_b`/`eval_c` only ever get `num_constraints` entries from the host;
-        // the domain padding beyond that is always zero, so it's zeroed here directly on
-        // the device instead of being materialized and transferred from the host.
-        T::zero_device_shares_from(&mut self.eval_a, matrices.a.len());
-        T::zero_device_shares_from(&mut self.eval_b, matrices.b.len());
-
         let eval_a = evaluate_constraint::<B::ArkPairing, U>(
             *id,
             &matrices.a,
@@ -241,14 +260,18 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 public_inputs,
                 private_witness,
             );
-            eval_c_buf
-                .index_mut(eval_c.len()..)
-                .memset(0, domain_size - eval_c.len())
-                .expect("Failed to zero device buffer tail");
             T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf, 0);
         }
 
-        T::shares_to_half_share_device_into::<B, U>(private_witness, &mut self.witness_half_shares);
+        // Upload the private witness straight into `combined_scalars`'s private segment,
+        // where the `a`/`b_g1`/`b_g2`/`l` MSMs read it from directly (see
+        // `launch_witness_independent_msms`); no separate witness buffer or copy needed.
+        let pub_len = self.prepared_key.num_instance_variables - 1;
+        T::shares_to_half_share_device_into::<B, U>(
+            private_witness,
+            &mut self.combined_scalars,
+            pub_len,
+        );
         ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
 
         tracing::info!(
@@ -312,14 +335,10 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let ProvingKey { h_query, .. } = self.prepared_key.as_ref();
         let h = &self.scratch.h;
 
-        // Result slot within `msm_results_g1`; must stay in sync with
-        // `launch_witness_independent_msms` and `finish_proof_with_assignment`'s read-back.
-        const H: usize = 3;
-
         msm_into(
             h_query,
             h,
-            &mut self.msm_results_g1[H..H + 1],
+            &mut self.msm_results_g1[MSM_SLOT_H..MSM_SLOT_H + 1],
             &self.streams.g1,
             PRECOMPUTE_FACTOR_G1,
         );
@@ -341,9 +360,10 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let stream_g1 = &self.streams.g1;
         let stream_g2 = &self.streams.g2;
 
-        // Fill the combined scalar buffer: `public_inputs[1..] ++ witness_half_shares`
-        // (gated per-protocol on the public segment, see `write_combined_public_segment`),
-        // used by the `a`/`b_g1`/`b_g2` MSMs below instead of a separate public-only and
+        // Fill the public segment of the combined scalar buffer (gated per-protocol, see
+        // `write_combined_public_segment`); the private segment was already uploaded
+        // directly into `combined_scalars[pub_len..]` in `prove`. Together they're used by
+        // the `a`/`b_g1`/`b_g2` MSMs below instead of a separate public-only and
         // private-only MSM each.
         let pub_len = self.public_inputs.len() - 1;
         {
@@ -353,43 +373,33 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 public_tail,
                 &mut self.combined_scalars[..pub_len],
             );
-            self.combined_scalars[pub_len..]
-                .copy(&self.witness_half_shares)
-                .expect("Failed to write private segment of combined MSM scalars");
         }
-
-        // Result slots within `msm_results_g1` / `msm_results_g2`; must stay in sync with
-        // `finish_proof_with_assignment`'s read-back.
-        const A: usize = 0;
-        const B_G1: usize = 1;
-        const L: usize = 2;
-        const B_G2: usize = 0;
 
         msm_into(
             a_query,
             &self.combined_scalars,
-            &mut self.msm_results_g1[A..A + 1],
+            &mut self.msm_results_g1[MSM_SLOT_A..MSM_SLOT_A + 1],
             stream_g1,
             PRECOMPUTE_FACTOR_G1,
         );
         msm_into(
             b_g1_query,
             &self.combined_scalars,
-            &mut self.msm_results_g1[B_G1..B_G1 + 1],
+            &mut self.msm_results_g1[MSM_SLOT_B_G1..MSM_SLOT_B_G1 + 1],
             stream_g1,
             PRECOMPUTE_FACTOR_G1,
         );
         msm_into(
             b_g2_query,
             &self.combined_scalars,
-            &mut self.msm_results_g2[B_G2..B_G2 + 1],
+            &mut self.msm_results_g2[MSM_SLOT_B_G2..MSM_SLOT_B_G2 + 1],
             stream_g2,
             PRECOMPUTE_FACTOR_G2,
         );
         msm_into(
             l_query,
-            &self.witness_half_shares,
-            &mut self.msm_results_g1[L..L + 1],
+            &self.combined_scalars[pub_len..],
+            &mut self.msm_results_g1[MSM_SLOT_L..MSM_SLOT_L + 1],
             stream_g1,
             PRECOMPUTE_FACTOR_G1,
         );
@@ -449,8 +459,13 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             .copy_to_host(HostSlice::from_mut_slice(&mut results_g2))
             .expect("Failed to read back G2 MSM results");
 
-        let [acc_r_g1, acc_s_g1, l_acc, h_acc] = results_g1;
-        let [acc_s_g2] = results_g2;
+        let (acc_r_g1, acc_s_g1, l_acc, h_acc) = (
+            results_g1[MSM_SLOT_A],
+            results_g1[MSM_SLOT_B_G1],
+            results_g1[MSM_SLOT_L],
+            results_g1[MSM_SLOT_H],
+        );
+        let acc_s_g2 = results_g2[MSM_SLOT_B_G2];
 
         // Everything below is host-side curve arithmetic, so move into arkworks (built with
         // the `asm` feature here) rather than icicle's generic host C++ implementations, and

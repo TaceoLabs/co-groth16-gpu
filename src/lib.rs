@@ -14,15 +14,21 @@ pub use groth16_gpu::{
 };
 
 pub fn load_backend_from_env_and_set_device(device_idx: i32) {
-    // The CPU backend is compiled directly into the curve/field libraries
-    // (not a dynamically loaded `icicle_backend_*.so`), so there is nothing
-    // to load for it and this call fails even in a correctly set up CPU-only
-    // build. Only a real backend (e.g. CUDA) needs to load successfully.
-    let _ = runtime::load_backend_from_env_or_default();
-
     // Device type defaults to CUDA; set ICICLE_DEVICE_TYPE=CPU to run against
     // icicle's built-in CPU reference backend, e.g. for testing without a GPU.
     let device_type = std::env::var("ICICLE_DEVICE_TYPE").unwrap_or_else(|_| "CUDA".to_string());
+
+    // The CPU backend is compiled directly into the curve/field libraries
+    // (not a dynamically loaded `icicle_backend_*.so`), so there is nothing
+    // to load for it and this call fails even in a correctly set up CPU-only
+    // build. Only a real backend (e.g. CUDA) needs to load successfully, so
+    // still propagate failures for anything other than the CPU backend.
+    if device_type == "CPU" {
+        let _ = runtime::load_backend_from_env_or_default();
+    } else {
+        runtime::load_backend_from_env_or_default().unwrap();
+    }
+
     let device = icicle_runtime::Device::new(&device_type, device_idx);
     icicle_runtime::set_device(&device).unwrap();
 }

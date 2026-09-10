@@ -269,10 +269,11 @@ where
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     ) {
         // A degree-t Shamir share is already a valid degree-2t (half) share, so there's
         // nothing to convert.
-        Self::shares_to_device_into::<B, T>(shares, dst, 0);
+        Self::shares_to_device_into::<B, T>(shares, dst, start);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(

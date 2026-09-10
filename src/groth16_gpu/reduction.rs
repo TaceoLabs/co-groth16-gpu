@@ -1,7 +1,10 @@
 use eyre::Result;
-use icicle_core::vec_ops::{VecOpsConfig, scalar_mul, sub_scalars};
+use icicle_core::{
+    traits::FieldImpl,
+    vec_ops::{VecOps, VecOpsConfig, scalar_mul, sub_scalars},
+};
 use icicle_runtime::{
-    memory::{DeviceSlice, DeviceVec, HostSlice},
+    memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice},
     stream::IcicleStream,
 };
 use mpc_core::MpcState;
@@ -59,6 +62,37 @@ pub struct ReductionScratch<F> {
     /// [`CircomReduction`], also doubles as the `a*b` scratch before the final subtraction
     /// turns it into `h` in place.
     pub(crate) h: DeviceVec<F>,
+}
+
+/// Computes `dst := dst - rhs` in place, i.e. without a separate output buffer.
+///
+/// `sub_scalars` takes three independent slice parameters (`a`, `b`, `result`), so calling it
+/// with `dst` reused for both `a` and `result` requires a reference to `dst`'s memory that is
+/// not `dst` itself. We build that reference from a raw pointer instead of reborrowing `dst`,
+/// and never hold it alongside a live `&mut` reborrow of `dst`. This is sound because
+/// `sub_scalars` immediately crosses into an opaque (non-inlined) FFI call, whose CUDA/CPU
+/// kernel processes each element independently (`result[i] = a[i] - b[i]`, no cross-lane
+/// reads), so there is no observable difference between "read all of `a`, then write all of
+/// `result`" and the interleaved reads/writes the kernel actually performs.
+fn sub_scalars_in_place<F: FieldImpl>(
+    dst: &mut DeviceVec<F>,
+    rhs: &DeviceSlice<F>,
+    cfg: &VecOpsConfig,
+) -> Result<(), icicle_runtime::errors::eIcicleError>
+where
+    F::Config: VecOps<F>,
+{
+    let len = dst.len();
+    // SAFETY: `dst_view` is constructed from a raw pointer obtained via `as_mut_ptr`, not by
+    // reborrowing `dst`, so it carries no live borrow of `dst`. It is used only as the
+    // immediate `a` argument below, never alongside a concurrently-live `&mut` reborrow of
+    // `dst`. See the elementwise-kernel argument above for why the resulting read/write
+    // overlap is sound.
+    let dst_view: &DeviceSlice<F> = unsafe {
+        let dst_ptr = dst.as_mut_ptr() as *const F;
+        DeviceSlice::from_slice(std::slice::from_raw_parts(dst_ptr, len))
+    };
+    sub_scalars(dst_view, rhs, dst.as_mut_slice(), cfg)
 }
 
 impl<F> ReductionScratch<F> {
@@ -164,15 +198,11 @@ impl R1CSToQAP for CircomReduction {
             let h = &mut scratch.h;
             T::local_mul_vec::<B>(eval_a, eval_b, state, stream_a, h);
 
-            // h := h - c, in place. Safe for the same reason `distribute_powers_and_mul_by_const`
-            // aliases its input and output: `sub_scalars` is elementwise, so output[i] only
-            // ever depends on input[i].
-            let h_in: &DeviceSlice<B::IcicleScalarField> =
-                unsafe { &*(&**h as *const DeviceSlice<B::IcicleScalarField>) };
+            // h := h - c, in place; see `sub_scalars_in_place` for why this is sound.
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
             cfg.is_async = true;
-            sub_scalars(h_in, &*c, h.as_mut_slice(), &cfg).unwrap();
+            sub_scalars_in_place(h, &*c, &cfg).unwrap();
 
             stream_c.synchronize().unwrap();
         });
@@ -259,13 +289,11 @@ impl R1CSToQAP for LibSnarkReduction {
 
             let h = &mut scratch.h;
 
-            // sub := sub - c, in place; same elementwise-aliasing argument as above.
-            let sub_in: &DeviceSlice<B::IcicleScalarField> =
-                unsafe { &*(&**sub as *const DeviceSlice<B::IcicleScalarField>) };
+            // sub := sub - c, in place; see `sub_scalars_in_place` for why this is sound.
             let mut cfg = VecOpsConfig::default();
             cfg.stream_handle = **stream_c;
             cfg.is_async = true;
-            sub_scalars(sub_in, c, sub.as_mut_slice(), &cfg).unwrap();
+            sub_scalars_in_place(sub, &*c, &cfg).unwrap();
             scalar_mul(
                 HostSlice::from_slice(&vanishing_polynomial_over_coset),
                 &*sub,

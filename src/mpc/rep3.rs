@@ -206,6 +206,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     ) {
         if std::any::TypeId::of::<T>()
             != std::any::TypeId::of::<co_groth16::mpc::Rep3Groth16Driver>()
@@ -220,7 +221,7 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
 
         // Only the `a` component is a half share; the `b` component never reaches the device.
         let shares_a = shares.iter().map(|s| s.a).collect::<Vec<_>>();
-        ark_scalars_to_device_into_at(&shares_a, dst, 0);
+        ark_scalars_to_device_into_at(&shares_a, dst, start);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(

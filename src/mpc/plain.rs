@@ -146,9 +146,10 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     ) {
         // A plain share already *is* its half share, so there's nothing to convert.
-        Self::shares_to_device_into::<B, T>(shares, dst, 0);
+        Self::shares_to_device_into::<B, T>(shares, dst, start);
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(

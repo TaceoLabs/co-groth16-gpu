@@ -150,14 +150,15 @@ pub trait CircomGroth16Prover<
         start: usize,
     );
 
-    /// Uploads the half-share component of a vector of arithmetic shares into the
-    /// pre-allocated device vector. Local interaction only.
+    /// Uploads the half-share component of a vector of arithmetic shares into `dst` at the
+    /// given offset. Local interaction only.
     fn shares_to_half_share_device_into<
         B: ArkIcicleBridge<IcicleScalarField = F>,
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
         dst: &mut DeviceVec<F>,
+        start: usize,
     );
 
     /// Performs element-wise multiplication of two vectors of shared values, writing the
