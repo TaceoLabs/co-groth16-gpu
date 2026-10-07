@@ -59,7 +59,7 @@ mod tests {
 
     use crate::groth16_gpu::{Bn254PreparedKey, prepare_bn254_key};
     use crate::{
-        CircomReduction, Rep3CoGroth16, Rep3CoGroth16Prover, ShamirCoGroth16Prover,
+        CircomReduction, Groth16Prover, Rep3CoGroth16, Rep3CoGroth16Prover, ShamirCoGroth16Prover,
         groth16_gpu::Groth16, load_backend_from_env_and_set_device,
     };
 
@@ -96,20 +96,36 @@ mod tests {
         prepared_key = $prepared_key:expr,
         matrices = $matrices:expr,
         witness = $witness:expr,
-        silent = $silent:expr
+        silent = $silent:expr,
+        verify = $verify:expr
     ) => {{
             use std::time::Instant;
             install_tracing_once();
             let prepared_key = $prepared_key;
             let witness = $witness;
+            // Checks a proof against the verifying key, so a prover that returns a wrong proof
+            // fails the test instead of only being timed.
+            let check = |proof: &ark_groth16::Proof<Bn254>, label: &str| {
+                if $verify {
+                    let pvk = ark_groth16::prepare_verifying_key(&$pkey.vk);
+                    let valid = ark_groth16::Groth16::<Bn254>::verify_proof(
+                        &pvk,
+                        proof,
+                        &witness.public_inputs[1..],
+                    )
+                    .expect("proof verification runs");
+                    assert!(valid, "{label} proof does not verify");
+                }
+            };
 
             // ---- CPU prove ----
             if !$silent {
                 tracing::info!("------------------- Proving (CPU) --------------------");
             }
             let t0 = Instant::now();
-            let _ = ($cpu_prove)($pkey, $matrices, witness.clone())
+            let proof = ($cpu_prove)($pkey, $matrices, witness.clone())
                 .expect("CPU proof generation works");
+            check(&proof, "CPU");
             if !$silent {
                 tracing::info!("Time taken for CPU proving: {:?}", t0.elapsed());
 
@@ -117,8 +133,9 @@ mod tests {
                 tracing::info!("-------------- Proving (GPU before warm-up) --------------");
             }
             let t1 = Instant::now();
-            let _ = ($gpu_prove)($pkey, prepared_key.clone(), $matrices, witness.clone())
+            let proof = ($gpu_prove)($pkey, prepared_key.clone(), $matrices, witness.clone())
                 .expect("GPU proof generation works (before warm-up)");
+            check(&proof, "GPU (before warm-up)");
 
             if !$silent {
                 tracing::info!(
@@ -130,8 +147,9 @@ mod tests {
                 tracing::info!("-------------- Proving (GPU after warm-up) --------------");
             }
             let t2 = Instant::now();
-            let _ = ($gpu_prove)($pkey, prepared_key, $matrices, witness)
+            let proof = ($gpu_prove)($pkey, prepared_key, $matrices, witness.clone())
                 .expect("GPU proof generation works (after warm-up)");
+            check(&proof, "GPU (after warm-up)");
 
             if !$silent {
                 tracing::info!(
@@ -148,7 +166,7 @@ mod tests {
         _prepared_key: Option<Arc<Bn254PreparedKey>>,
         _matrices: &ConstraintMatrices<P::ScalarField>,
         _witness: SharedWitness<P::ScalarField, Rep3PrimeFieldShare<P::ScalarField>>,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<ark_groth16::Proof<P>> {
         let _ = Rep3State::new(net, A2BType::default()).unwrap();
 
         // Dummy network operations
@@ -167,7 +185,8 @@ mod tests {
         ))
         .unwrap();
 
-        Ok(())
+        // Only plays the network role of a co-party; the proof itself is meaningless.
+        Ok(ark_groth16::Proof::default())
     }
 
     #[test]
@@ -197,15 +216,27 @@ mod tests {
                 matrices.num_instance_variables,
             );
 
+            // A single stateful prover reused for both GPU runs, so the second run exercises
+            // the cached GPU buffers (whose domain padding the first run leaves dirty).
+            let prepared_key = Arc::new(prepared_key);
+            let mut prover = Groth16Prover::<Bn254, CircomReduction>::from_prepared_bn254_key(
+                Arc::clone(&prepared_key),
+            );
+            let mut gpu_prove =
+                |_pkey, _prepared_key: Option<Arc<Bn254PreparedKey>>, matrices, witness| {
+                    prover.prove(matrices, witness)
+                };
+
             run_provers!(
                 cpu_prove =
                     co_groth16::Groth16::<Bn254>::plain_prove::<co_groth16::CircomReduction>,
-                gpu_prove = Groth16::<Bn254>::plain_prove::<CircomReduction>,
+                gpu_prove = gpu_prove,
                 pkey = &pkey,
-                prepared_key = Some(Arc::new(prepared_key)),
+                prepared_key = Some(prepared_key),
                 matrices = &matrices,
                 witness = witness,
-                silent = false
+                silent = false,
+                verify = true
             );
         }
     }
@@ -243,7 +274,8 @@ mod tests {
                 prepared_key = Some(Arc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
-                silent = false
+                silent = false,
+                verify = true
             );
         }
     }
@@ -286,7 +318,8 @@ mod tests {
                 prepared_key = Some(Arc::new(prepared_key)),
                 matrices = &matrices,
                 witness = witness,
-                silent = false
+                silent = false,
+                verify = true
             );
         }
     }
@@ -362,7 +395,9 @@ mod tests {
                             prepared_key = Some(Arc::clone(&prepared_key)),
                             matrices = &zkey.0,
                             witness = x,
-                            silent = false // only print for the first party to avoid cluttering the output
+                            silent = false, // only print for the first party to avoid cluttering the output
+                            // The co-parties run `dummy_prove`, so this proof is invalid by design.
+                            verify = false
                         );
                     } else {
                         let cpu_prove = |pkey, matrices, witness| {
@@ -380,7 +415,8 @@ mod tests {
                             prepared_key = None, // only the first party prepares the key to avoid redundant work
                             matrices = &zkey.0,
                             witness = x,
-                            silent = true
+                            silent = true,
+                            verify = false
                         );
                     }
                 }));
@@ -478,7 +514,8 @@ mod tests {
                             prepared_key = Some(Arc::clone(&prepared_key)),
                             matrices = &zkey.0,
                             witness = x,
-                            silent = false // only print for the first party to avoid cluttering the output
+                            silent = false, // only print for the first party to avoid cluttering the output
+                            verify = true
                         );
                     } else {
                         let gpu_prove = |pkey,
@@ -500,7 +537,8 @@ mod tests {
                             prepared_key = None, // only the first party prepares the key to avoid redundant work
                             matrices = &zkey.0,
                             witness = x,
-                            silent = true
+                            silent = true,
+                            verify = true
                         );
                     }
                 }));
@@ -579,7 +617,8 @@ mod tests {
                         prepared_key = Some(prepared_key),
                         matrices = &zkey.0,
                         witness = x,
-                        silent = net.id() != 0 // only print for the first party to avoid cluttering the output
+                        silent = net.id() != 0, // only print for the first party to avoid cluttering the output
+                        verify = true
                     );
                 }));
             }

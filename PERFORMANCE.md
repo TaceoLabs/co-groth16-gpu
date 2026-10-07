@@ -2,120 +2,125 @@
 
 This review covers the Shamir proving path only:
 
-- `ShamirCoGroth16Prover::prove` ([src/groth16_gpu.rs](src/groth16_gpu.rs))
+- `ShamirCoGroth16Prover::prove` ([src/groth16_gpu.rs](src/groth16_gpu.rs)), both the default path (fresh state per proof) and the opt-in persistent-state path
 - the internal `CoGroth16Icicle` prover it wraps
 - `ShamirGroth16Driver` ([src/mpc/shamir.rs](src/mpc/shamir.rs))
 - the witness reductions in [src/groth16_gpu/reduction.rs](src/groth16_gpu/reduction.rs)
+- the Icicle CUDA backend behavior these depend on (`icicle-snark` rev `bf00385`, paths below are relative to `icicle/backend/cuda/src/` in that checkout)
 
-> **Status:** these findings come from reading the code. Nothing has been profiled or benchmarked yet, so the impact ranking is an estimate. An `nsys` profile of one Shamir proof, together with timings of the preprocessing step, would confirm or reorder it.
+> **Status:** these findings come from reading this crate and the Icicle CUDA backend source. Nothing has been profiled yet, so the impact ranking is an estimate. An `nsys` profile of one Shamir proof would confirm or reorder it; the log lines named below give a first check without one. Run with `RUST_LOG=debug` to also get the Shamir preprocessing time and the per-upload copy/`from_mont` split.
 >
-> Finding 1 is resolved and finding 2 is partially resolved; their sections describe what was changed and what remains. The original analysis of each is kept for reference. Run with `RUST_LOG=debug` to get the preprocessing time and the per-upload copy/`from_mont` split.
+> This is the second pass. The first pass's findings that have since been fixed are summarized under [Resolved](#resolved); the open ones are carried over with updated line references.
 
 ## Summary
 
 | # | Issue | Where | Impact |
 |---|-------|-------|--------|
-| 1 | ~~Shamir preprocessing runs over the network on every proof, before any other work~~ **Resolved:** overlapped with host work | [groth16_gpu.rs:903-915](src/groth16_gpu.rs#L903-L915) | High (scales with network latency) |
-| 2 | Witness upload and Montgomery conversion are serial and synchronous. **Partially resolved:** uploads now overlap CPU evaluation; still synchronous and unpinned | [groth16_gpu.rs:216-283](src/groth16_gpu.rs#L216-L283), [bridges.rs:69-90](src/bridges.rs#L69-L90) | High |
-| 3 | `local_mul_vec` host sync stops the reduction streams from overlapping | [shamir.rs:183-198](src/mpc/shamir.rs#L183-L198), [reduction.rs:142](src/groth16_gpu/reduction.rs#L142) | Medium |
-| 4 | `evaluate_constraint` reallocates on `resize` | [utils.rs:73-79](src/utils.rs#L73-L79) | Medium |
-| 5 | `promote_to_trivial_shares` allocates and copies twice | [shamir.rs:80-88](src/mpc/shamir.rs#L80-L88), [reduction.rs:130-131](src/groth16_gpu/reduction.rs#L130-L131) | Medium |
-| 6 | Smaller items: MSM stream balance, host syncs | various | Low |
+| 1 | "Async" MSM launches block the host, so the reduction is not issued until most MSMs have finished | [groth16_gpu.rs:376-491](src/groth16_gpu.rs#L376-L491), `msm/cuda_msm.cuh:590-597` | High |
+| 2 | Synchronous default-stream copies at the start of the reduction wait for every in-flight MSM | [shamir.rs:162-171](src/mpc/shamir.rs#L162-L171), [reduction.rs:166](src/groth16_gpu/reduction.rs#L166), `cuda_device_api.cu:75,101` | High |
+| 3 | Uploads are synchronous copies from unpinned memory (partially resolved) | [groth16_gpu.rs:290-368](src/groth16_gpu.rs#L290-L368), [bridges.rs:84-115](src/bridges.rs#L84-L115) | Medium |
+| 4 | `local_mul_vec` host sync stops the reduction streams from overlapping | [shamir.rs:279-294](src/mpc/shamir.rs#L279-L294), [reduction.rs:177](src/groth16_gpu/reduction.rs#L177) | Medium |
+| 5 | Persistent Shamir state is topped up two pairs at a time, serially, before the upload | [groth16_gpu.rs:1025-1037](src/groth16_gpu.rs#L1025-L1037), [groth16_gpu.rs:1113](src/groth16_gpu.rs#L1113) | Low–medium (only with more than 3 parties) |
+| 6 | Smaller items: host buffer reuse, public-segment copy, Icicle per-MSM overhead, LibSnark syncs | various | Low |
+
+Findings 1 and 2 have to be fixed together. Each one alone is enough to serialize the witness-independent MSMs and the reduction, which is the overlap `prove_inner` is designed around.
 
 **Suggested order:**
-1. ~~Overlap or amortize the preprocessing (finding 1).~~ Done (overlap).
-2. Profile the upload/conversion phase, then add the required Icicle pinned-memory support before attempting a fully asynchronous upload pipeline (finding 2). The CPU/transfer overlap part is done.
-3. Fix findings 3 and 5 together, since both touch the start of the reduction.
+1. Confirm finding 1 from the existing logs (see below), then fix findings 1 and 2 together.
+2. Fix finding 4 once the reduction actually runs alongside the MSMs; its stall matters more then.
+3. Pinned-memory uploads (finding 3) need an Icicle upgrade or patch first.
 
 ## High impact
 
-### 1. Shamir preprocessing runs over the network on every proof — resolved
+### 1. "Async" MSM launches block the host
 
-[groth16_gpu.rs:903-915](src/groth16_gpu.rs#L903-L915), [groth16_gpu.rs:173-199](src/groth16_gpu.rs#L173-L199)
+[groth16_gpu.rs:376-414](src/groth16_gpu.rs#L376-L414) (`prove_inner`), [groth16_gpu.rs:436-491](src/groth16_gpu.rs#L436-L491) (`launch_witness_independent_msms`), [groth16_gpu.rs:419-430](src/groth16_gpu.rs#L419-L430) (`launch_h_msm`)
 
-**What changed:** the preprocessing is now overlapped with the host work. `CoGroth16Icicle::prove_with_state_init` runs the state creation (`ShamirPreprocessing::new` + `ShamirState::from`) on a separate thread while the host evaluates and uploads the constraints, and joins it before the witness map. `Rep3CoGroth16Prover` uses the same path for `Rep3State::new`, which also has a network round. The plain prover has no state to set up and keeps the direct `prove` path. The protocol's network messages are unchanged, so the desynchronization risk of the amortize option does not apply. Amortizing (persistent `ShamirState`) remains possible as a follow-up if the preprocessing turns out to be longer than the host work it now hides behind.
+`prove_inner` launches the four witness-independent MSMs (`a`, `b_g1`, `l` on `streams.g1`; `b_g2` on `streams.g2`) and then issues the witness-map reduction, expecting the host to return from the launches immediately. It doesn't.
 
-**Original analysis:** `ShamirCoGroth16Prover::prove` builds a fresh `ShamirPreprocessing` for every proof, only to get the two random shares `r` and `s`. In `mpc-core`, `ShamirPreprocessing::new` does the following:
+In the Icicle CUDA MSM, partway through each call (after the bucket sort), the host reads two bucket counts back with `cudaMemcpyAsync(&h_nof_buckets_to_compute, ..., cudaMemcpyDeviceToHost, stream)` into stack variables (`msm/cuda_msm.cuh:590-597`, and `:660` for the large-bucket count), then uses them to size the next kernels. A device-to-host copy into pageable memory is synchronous for the host. So each `msm_into` call returns only after:
 
-- Exchanges seeds with the other parties (`ShamirRng::new`). This is a network round.
-- Runs `buffer_triples` to create random double shares. This involves a further `send_many`/`recv_many` exchange.
-- In `ShamirState::from`, recomputes the Lagrange coefficients, which only depend on `num_parties`, `threshold` and the party ID.
+- all earlier work on its stream has finished, and
+- its own sort phase has finished.
 
-All of this happens before constraint evaluation starts and before any GPU work is launched. So every proof pays the network round-trip time up front. The randomness is not needed until `prove_inner` calls `T::rand` after the witness map ([groth16_gpu.rs:308](src/groth16_gpu.rs#L308)).
+With three G1 MSMs queued on one stream, `launch_witness_independent_msms` returns only after `a` and `b_g1` have completed and `l` is through its sort. Only then is the reduction issued. In practice the reduction runs after the G1 MSMs instead of alongside them. `launch_h_msm` has the same problem: it blocks until `a`, `b_g1` and `l` have drained from `streams.g1`.
 
-**Fix (pick one or combine):**
-- **Overlap it.** Run the preprocessing on a separate thread (`std::thread::scope` or `rayon::join`) while the host evaluates the constraints and uploads them. That host work doesn't use `net`. Join before `T::rand`. This needs `N: Sync`.
-- **Amortize it.** Keep a `ShamirState` in `ShamirCoGroth16Prover` across proofs and refill its random-pair buffer in larger batches. This also removes the per-proof seed exchange and the Lagrange recomputation. `get_pair` already refills on its own when the buffer is empty.
-
-Persistent state changes the sequence of network operations across proofs. Every party must enable it consistently and consume/refill correlated randomness in the same order, or the protocol can desynchronize.
-
-### 2. Witness upload and Montgomery conversion are serial and synchronous — partially resolved
-
-[groth16_gpu.rs:216-283](src/groth16_gpu.rs#L216-L283), [bridges.rs:69-90](src/bridges.rs#L69-L90)
-
-**What changed:**
-- `upload_inputs` runs each upload on its own scoped thread, so transfers overlap the host-side evaluation. The witness and public inputs upload while `A` is evaluated, `A` uploads while `B` is evaluated, and `B` uploads while `C` (LibSnark only) is evaluated. Each thread selects the caller's Icicle device first, since the active device is thread-local.
-- `ark_scalars_to_device_into` logs the copy and `from_mont` times separately at debug level, for the profiling step below.
-
-**Still open:** the pinned-memory, async-stream and witness-during-reduction items below. Each upload is still a synchronous copy from ordinary memory followed by a synchronous `from_mont`; it just no longer blocks the CPU evaluation. The threads are spawned per proof (measured at ~0.2 ms for four threads under WSL), which is small next to a proof but could be replaced by reusable workers if it shows up for small circuits.
-
-**Original analysis:** the steps ran strictly one after another: CPU evaluates `eval_a`, blocking upload, CPU evaluates `eval_b`, blocking upload. The same happens for `eval_c` (LibSnark only), the witness and the public inputs. CPU work never overlapped a transfer.
-
-The cost sits inside `ark_scalars_to_device_into`:
-
-- **Synchronous copy from ordinary Rust memory.** It uses `copy_from_host`, so the host waits for every transfer to finish. The performance difference from pinned memory is hardware- and transfer-size-dependent and needs measurement.
-- **Synchronous Montgomery conversion.** `from_mont` receives `IcicleStream::default()`. In this Icicle revision a null stream sets `is_async = false`, so the conversion completes before the call returns.
-
-At present these operations do not stall already-running reduction or MSM streams: `prove_inner` starts the reduction only after every upload has returned, and the MSMs start after the reduction. The problem is the resulting lack of CPU/GPU overlap. Default-stream ordering would become an additional concern only after the surrounding work is made concurrent.
+**How to confirm without a profiler:** the info log `Launching witness-independent MSMs took N ms` should be close to zero if the launches were async. A value close to the time of two to three G1 MSMs confirms this finding.
 
 **Fix:**
-- First profile copies and Montgomery conversion separately to establish how much of this phase is worth optimizing.
-- Add or upgrade to Icicle support for pinned host allocation. The pinned Icicle revision currently exposes `HostSlice` over ordinary memory and its CUDA backend reports `supports_pinned_memory = false`; it does not provide the reusable pinned buffers required for reliable transfer/CPU overlap.
-- Once pinned memory is available, keep reusable pinned staging buffers in `CoGroth16Icicle`. Upload with `copy_from_host_async` on a dedicated stream and run `from_mont` on that stream. Keep each staging buffer alive and unchanged until its stream has completed.
-- Without pinned-memory support, asynchronous copies from ordinary memory may be synchronously staged by CUDA. They can be benchmarked, but overlap should not be assumed.
-- ~~Start evaluating the next matrix on the CPU while the previous one uploads.~~ Done.
-- Upload the public inputs before starting the reduction, which consumes them immediately. The private-witness upload is not consumed until the later MSM phase, so it can potentially overlap with the reduction if an explicit stream dependency makes it complete before those MSMs begin.
+- Issue each MSM stream's launches from its own host thread (the `on_device` helper from the upload phase already handles the thread-local device), while the main thread issues the reduction. Join the MSM threads before `finish_proof_with_assignment` reads the results.
+- Give the `h` MSM its own stream (or put it on `streams.g2`, which carries only `b_g2`), so its launch does not wait for the other G1 MSMs to drain.
+- The GPU's compute is shared, so concurrent MSMs and NTTs won't add up linearly. The gain is in removing the host-side gaps and letting the reduction's smaller kernels fill the GPU between MSM phases.
+- The upstream fix is for Icicle to read those counters through pinned host memory. That would make the launches truly async, but needs an Icicle patch.
+
+### 2. Synchronous default-stream copies wait for every in-flight MSM
+
+[shamir.rs:162-171](src/mpc/shamir.rs#L162-L171), [reduction.rs:166](src/groth16_gpu/reduction.rs#L166) (Circom), [reduction.rs:249](src/groth16_gpu/reduction.rs#L249) (LibSnark)
+
+The Icicle CUDA backend creates every stream with plain `cudaStreamCreate` (`cuda_device_api.cu:101`), so all of them are *blocking* streams. Its synchronous `copy` and `memset` use `cudaMemcpy`/`cudaMemset` on the legacy default stream (`cuda_device_api.cu:59,75`). The backend is not built with per-thread default streams. Under these semantics, a legacy-default-stream operation waits for all earlier work on every blocking stream, and later work on those streams waits for it.
+
+The first thing each reduction does is `T::write_trivial_shares_into`. For Shamir this is a synchronous device-to-device `copy` of the public inputs into `eval_a[num_constraints..]`. It runs right after the MSM launches, so it waits for all four witness-independent MSMs to finish before the reduction can start. This holds even after finding 1 is fixed. The REP3 and plain drivers use the same synchronous `copy`/`memset` calls.
+
+**Fix:**
+- Make `write_trivial_shares_into` asynchronous: `copy_async`/`memset_async` on the reduction's stream `a` (pass the stream in), so it is ordered before the iFFT on `a` and doesn't touch the default stream.
+- Better for Shamir: write the public inputs into `eval_a[num_constraints..]` from the host during the upload phase. Every Shamir party writes the same values, so no device-to-device copy is needed at all. (REP3 needs the id-dependent split.)
+- As a rule, nothing between the first MSM launch and the final `streams.g1/g2.synchronize()` may use a synchronous Icicle copy, memset, `device_malloc` or drop of a `DeviceVec`, or a null-stream Icicle call. Each of these is an implicit device-wide barrier here.
+- Making Icicle create non-blocking streams (`cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)`) would remove the implicit barriers entirely, but needs an Icicle patch.
 
 ## Medium impact
 
-### 3. `local_mul_vec` host sync stops the reduction streams from overlapping
+### 3. Uploads are synchronous copies from unpinned memory — partially resolved
 
-[shamir.rs:183-198](src/mpc/shamir.rs#L183-L198), [reduction.rs:142](src/groth16_gpu/reduction.rs#L142)
+[groth16_gpu.rs:290-368](src/groth16_gpu.rs#L290-L368), [bridges.rs:84-115](src/bridges.rs#L84-L115)
 
-`ShamirGroth16Driver::local_mul_vec` ends with `stream.synchronize()`. In `CircomReduction`, the `c = a·b` product is launched on stream `c` before any FFT work for `a` and `b`. The host therefore waits for that kernel to finish, plus one host round trip, before streams `a` and `b` get any work. The product is a single `mul_scalars`, so the stall is short, but it is still serialization on the critical path that the three streams were meant to avoid.
+**Already done:** `upload_inputs` runs each upload on its own scoped thread, so transfers overlap the host-side constraint evaluation: the witness (straight into `combined_scalars[pub_len..]`) and public inputs upload while `A` is evaluated, `A` uploads while `B` is evaluated, and `B` uploads while `C` (LibSnark only) is evaluated. Only `num_constraints` entries are uploaded per matrix; the domain padding after them is zeroed with a device memset in the same upload thread, on every proof. `ark_scalars_to_device_into_at` logs the copy and `from_mont` times separately at debug level.
 
-In `LibSnarkReduction` ([reduction.rs:250-252](src/groth16_gpu/reduction.rs#L250-L252)), stream `a` is synchronized twice in a row, once inside `local_mul_vec` and again right after it.
+**Still open:**
+- Each upload is still a synchronous `cudaMemcpy` from pageable memory, followed by a `from_mont` on the null stream, which Icicle runs synchronously. That's fine for the overlap above, but it caps transfer bandwidth. The pinned Icicle revision reports `supports_pinned_memory = false` (`cuda_device_api.cu:116`) and has no pinned host allocation API.
+- Once pinned memory is available: keep reusable pinned staging buffers in `CoGroth16Icicle`, evaluate the constraints straight into them, and upload with `copy_from_host_async` plus `from_mont` on a dedicated stream. Keep each staging buffer unchanged until its stream has completed.
+- The threads are spawned per proof (measured at ~0.2 ms for four threads under WSL). This is small next to a proof, but could be replaced by reusable workers if it shows up for small circuits.
 
-**Caution:** in `CircomReduction` the sync is currently needed for correctness. Stream `c` reads `eval_a`/`eval_b` while the in-place iFFT on streams `a`/`b` overwrites them. Removing the sync without adding another dependency introduces a data race.
+### 4. `local_mul_vec` host sync stops the reduction streams from overlapping
+
+[shamir.rs:279-294](src/mpc/shamir.rs#L279-L294), [reduction.rs:177](src/groth16_gpu/reduction.rs#L177), [reduction.rs:194-199](src/groth16_gpu/reduction.rs#L194-L199)
+
+`ShamirGroth16Driver::local_mul_vec` ends with `stream.synchronize()`. In `CircomReduction`, the `c = a·b` product is launched on stream `c` before any FFT work for `a` and `b`, so the host waits for that kernel plus a host round trip before streams `a` and `b` get any work. The second call (`h = a·b` on stream `a`) is preceded by `stream_b.synchronize()` and then syncs stream `a`, so the host waits there too before issuing the final subtraction on stream `c`.
+
+In `LibSnarkReduction` ([reduction.rs:280-288](src/groth16_gpu/reduction.rs#L280-L288)) the same pattern applies: a host sync on stream `b`, then the product with its internal sync on stream `a`.
+
+**Caution:** in `CircomReduction` the first sync is needed for correctness. Stream `c` reads `eval_a`/`eval_b` while the in-place iFFT on streams `a`/`b` overwrites them. Removing the sync without adding another dependency introduces a data race.
 
 **Fix:**
 - Remove the sync from `local_mul_vec` and let callers synchronize. The Shamir version has no temporaries that would be freed early, so this is safe at the driver level.
-- In `CircomReduction`, record an event on stream `c` after the product, and make streams `a`/`b` wait on that event before their iFFT. This orders the work on the GPU instead of blocking the host. The pinned Icicle Rust runtime does not currently expose event record/wait operations, so this requires upgrading or extending its runtime bindings. Until then, retain the host synchronization or restructure the buffers/work so the operations no longer race.
+- Order the streams on the GPU instead of on the host: record an event on stream `c` after the product and make streams `a`/`b` wait on it before their iFFT; likewise for the `b → a` and `a → c` handoffs. The pinned Icicle Rust runtime does not expose event record/wait, so this requires extending its bindings.
+- Without events: issue the first product on stream `a` itself (before its iFFT) and have stream `b`'s iFFT wait via one host sync of stream `a`, which removes one of the round trips. Any restructuring must keep the `eval_a`/`eval_b` read-before-overwrite ordering.
 
-### 4. `evaluate_constraint` reallocates on `resize`
+## Low–medium impact
 
-[utils.rs:73-79](src/utils.rs#L73-L79)
+### 5. Persistent Shamir state is topped up two pairs at a time, serially
 
-`collect()` sizes the Vec to exactly `num_constraints`. The following `resize(domain_size)` then reallocates and copies the whole vector. `evaluate_constraint_half_share`, used for `eval_c` in LibSnark, has the same problem. A fresh domain-sized Vec is also allocated on every proof.
+[groth16_gpu.rs:1025-1037](src/groth16_gpu.rs#L1025-L1037) (`preprocess`), [groth16_gpu.rs:1113](src/groth16_gpu.rs#L1113)
 
-**Fix:** allocate with `Vec::with_capacity(domain_size)` and fill it with `par_extend`. Better still, evaluate directly into the reusable pinned staging buffers from finding 2.
+On the persistent path, every `prove` calls `self.preprocess(net, 1)` before the upload. `ShamirState::buffer_triples` is a no-op when enough pairs are buffered. But unless the caller pre-filled the buffer with a large `preprocess(net, n)`, the buffer holds exactly the two pairs the previous proof used up, so every proof generates two fresh pairs. For 3 parties this needs no communication. For more parties it is a `random_double_share` network round on every proof, on the critical path, before any host or GPU work. This is the cost the overlap on the default path was added to hide.
 
-### 5. `promote_to_trivial_shares` allocates and copies twice
-
-[shamir.rs:80-88](src/mpc/shamir.rs#L80-L88), [reduction.rs:130-131](src/groth16_gpu/reduction.rs#L130-L131), [reduction.rs:215-216](src/groth16_gpu/reduction.rs#L215-L216)
-
-For Shamir, a public value is already a valid trivial share, so promotion is just a copy. The current code does all of this on every proof:
-
-- a blocking `device_malloc`
-- a copy on the default stream
-- a second copy into `eval_a`
-- a free when the temporary is dropped
-
-Both `cudaMalloc` and `cudaFree` synchronize the whole device.
-
-**Fix:** copy `public_inputs` directly into `eval_a[num_constraints..]` with an async copy on stream `a`. Ideally, upload the public inputs straight into that slice during the upload phase.
+**Fix:**
+- When the buffer is short, top up geometrically, as `ShamirState::get_pair` does internally, so the round trip is amortized over many proofs.
+- Or overlap the top-up with the upload, as `prove_with_state_init` does for the default path. The state lives in `ShamirCoGroth16Prover::state`, separate from `inner`, so a scoped thread can borrow it mutably while `inner` uploads.
+- All parties must top up in the same pattern, or the network desyncs (see the struct docs).
 
 ## Low impact
 
-- **Unbalanced MSM streams** ([groth16_gpu.rs:373-432](src/groth16_gpu.rs#L373-L432)). Seven G1 MSMs are serialized on `stream_g1`, including two tiny public-input MSMs, while `stream_g2` has only two. Afterwards, `get_first` makes eight separate blocking device-to-host copies. `h_acc`/`l_acc` could run on a third stream.
-- **Host syncs instead of events in `LibSnarkReduction`** ([reduction.rs:247-252](src/groth16_gpu/reduction.rs#L247-L252)). `stream_b.synchronize()` before the `a·b` product could be a cross-stream event wait.
+- **Per-proof host allocations for the evaluations** ([utils.rs:67-98](src/utils.rs#L67-L98)). `evaluate_constraint` allocates a fresh `num_constraints`-sized `Vec` per matrix per proof, so every proof pays for page faults on freshly mapped memory. Reusable host buffers in `CoGroth16Icicle` (cleared and `par_extend`ed) avoid this, and become the pinned staging buffers of finding 3 later.
+- **Public segment of `combined_scalars` via a device-to-device copy** ([groth16_gpu.rs:453-461](src/groth16_gpu.rs#L453-L461)). `write_combined_public_segment` does a synchronous default-stream copy before the MSMs on every proof. It is small and happens before the MSM launches, so it is not a barrier against them. For Shamir the segment could instead be written from the host during the upload phase.
+- **Icicle per-MSM overhead.** When an MSM takes the large-bucket path, Icicle creates a CUDA stream and event and, in async mode, a detached cleanup `std::thread` per call (`msm/cuda_msm.cuh:686`, `:1123`). This is up to five per proof and can only be changed in Icicle.
+- **Host syncs in `LibSnarkReduction`** ([reduction.rs:280](src/groth16_gpu/reduction.rs#L280)). `stream_b.synchronize()` before the `a·b` product could be a cross-stream event wait (needs the event bindings from finding 4).
+
+## Resolved
+
+Findings from the first pass that are fixed on this branch:
+
+- **Shamir preprocessing ran over the network before any other work.** On the default path, `prove_with_state_init` ([groth16_gpu.rs:242-268](src/groth16_gpu.rs#L242-L268)) now creates the state (`ShamirPreprocessing::new` + `ShamirState::from`) on a separate thread while the host evaluates and uploads the constraints, and joins before the reduction. REP3 uses the same path for `Rep3State::new`. The opt-in persistent state ([groth16_gpu.rs:1082-1129](src/groth16_gpu.rs#L1082-L1129)) adds the amortized alternative, which removes the per-proof seed exchange and Lagrange recomputation (see finding 5 for its remaining cost).
+- **Upload and CPU evaluation were fully serial.** Now overlapped; see finding 3 for what remains.
+- **`evaluate_constraint` reallocated on `resize`.** The host now produces exactly `num_constraints` entries with no padding, and `upload_inputs` zeroes the domain padding with a device memset on every proof ([groth16_gpu.rs:325-366](src/groth16_gpu.rs#L325-L366)). (An earlier version zeroed it only once, in `CoGroth16Icicle::new`. That produced invalid proofs from the second `prove` on a reused prover onwards, because the reduction's in-place (i)FFTs leave the padding dirty. The test macro now verifies every proof so this can't pass silently again.)
+- **`promote_to_trivial_shares` allocated, copied twice and freed per proof.** Replaced by `write_trivial_shares_into`, which copies straight into `eval_a[num_constraints..]` with no temporary buffer. Its remaining cost is the default-stream barrier in finding 2.
+- **Eight MSMs and eight blocking result read-backs.** The public and private MSMs are merged over `combined_scalars` (five MSMs per proof), results land in long-lived slots, and one device-to-host copy per curve reads them back ([groth16_gpu.rs:515-545](src/groth16_gpu.rs#L515-L545)). The witness-independent MSMs are launched before the reduction (but see findings 1 and 2).

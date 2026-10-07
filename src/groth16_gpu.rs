@@ -192,28 +192,12 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let domain_size = prepared_key.domain_size;
         let ark_key = ArkKeyConstants::new(&prepared_key);
 
-        // `eval_a`/`eval_b`/`eval_c` only ever get `num_constraints` entries from the host on
-        // each `prove` call; the domain padding beyond that is always zero and, since
-        // `num_constraints` is fixed for the lifetime of this prover (one instance per
-        // circuit), only needs zeroing once here rather than on every proof.
-        let mut eval_a = T::alloc_device_shares(domain_size);
-        let mut eval_b = T::alloc_device_shares(domain_size);
-        T::zero_device_shares_from(&mut eval_a, prepared_key.num_constraints);
-        T::zero_device_shares_from(&mut eval_b, prepared_key.num_constraints);
-        let mut eval_c = requires_eval_c.then(|| alloc(domain_size));
-        if let Some(eval_c_buf) = eval_c.as_mut() {
-            eval_c_buf
-                .index_mut(prepared_key.num_constraints..)
-                .memset(0, domain_size - prepared_key.num_constraints)
-                .expect("Failed to zero device buffer tail");
-        }
-
         Self {
             scratch: ReductionScratch::new(domain_size, requires_eval_c),
             streams: ProofStreams::new(),
-            eval_a,
-            eval_b,
-            eval_c,
+            eval_a: T::alloc_device_shares(domain_size),
+            eval_b: T::alloc_device_shares(domain_size),
+            eval_c: requires_eval_c.then(|| alloc(domain_size)),
             public_inputs: alloc(prepared_key.num_instance_variables),
             combined_scalars: alloc(
                 prepared_key.num_instance_variables - 1 + prepared_key.num_witness_variables,
@@ -298,6 +282,11 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     /// Each upload runs on its own thread so that it overlaps with the host-side evaluation
     /// of the next matrix: the witness and public inputs (which need no evaluation) upload
     /// while `A` is evaluated, `A` uploads while `B` is evaluated, and so on.
+    ///
+    /// The host only produces the first `num_constraints` entries of each evaluation; the
+    /// domain padding after them must be zero, so it is zeroed on the device here. This has
+    /// to happen on every proof, not once: the reduction's in-place (i)FFTs run over the
+    /// whole buffer and leave the padding dirty.
     fn upload_inputs<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static>(
         &mut self,
         id: <U::State as MpcState>::PartyID,
@@ -311,6 +300,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         // `combined_scalars` holds `public_inputs[1..] ++ private_witness`; the witness goes
         // straight into its private segment, where the MSMs read it from directly.
         let pub_len = self.prepared_key.num_instance_variables - 1;
+        let num_constraints = self.prepared_key.num_constraints;
         let device = icicle_runtime::get_active_device().expect("Failed to get active device");
         let Self {
             eval_a: eval_a_buf,
@@ -339,6 +329,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 private_witness,
             );
             s.spawn(on_device(&device, move || {
+                T::zero_device_shares_from(eval_a_buf, num_constraints);
                 T::shares_to_device_into::<B, U>(&eval_a, eval_a_buf, 0);
             }));
 
@@ -349,6 +340,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 private_witness,
             );
             s.spawn(on_device(&device, move || {
+                T::zero_device_shares_from(eval_b_buf, num_constraints);
                 T::shares_to_device_into::<B, U>(&eval_b, eval_b_buf, 0);
             }));
 
@@ -360,6 +352,11 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                     public_inputs,
                     private_witness,
                 );
+                let padding = eval_c_buf.len() - num_constraints;
+                eval_c_buf
+                    .index_mut(num_constraints..)
+                    .memset(0, padding)
+                    .expect("Failed to zero device buffer tail");
                 T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf, 0);
             }
         });
