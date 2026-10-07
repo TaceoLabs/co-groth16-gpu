@@ -6,6 +6,7 @@ use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
 use icicle_core::curve::{Affine, Projective};
+use icicle_runtime::Device;
 use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice, HostSlice};
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
@@ -136,6 +137,16 @@ pub type Bn254PreparedKey = ProvingKey<
     <Bn254Bridge as ArkIcicleBridge>::IcicleG2,
 >;
 
+/// Wraps `f` to run on the given Icicle device. The active device is thread-local, so a
+/// spawned thread must select it before touching device memory.
+fn on_device<F: FnOnce() + Send>(device: &Device, f: F) -> impl FnOnce() + Send {
+    let device = device.clone();
+    move || {
+        icicle_runtime::set_device(&device).expect("Failed to set device");
+        f();
+    }
+}
+
 // bls12_377/LibSnarkReduction support removed: not needed for our case atm,
 // and its h_query/domain_size length mismatch with LibSnarkReduction was
 // causing problems.
@@ -230,56 +241,133 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         matrices: &ConstraintMatrices<B::ArkScalarField>,
         public_inputs: &[B::ArkScalarField],
         private_witness: &[U::ArithmeticShare],
-    ) -> eyre::Result<ark_groth16::Proof<B::ArkPairing>> {
-        let setup_timer = std::time::Instant::now();
-        let id = state.id();
+    ) -> eyre::Result<ark_groth16::Proof<B::ArkPairing>>
+    where
+        U::ArithmeticShare: Sync,
+    {
+        let id = Self::cast_party_id::<U>(state.id());
+        self.upload_inputs::<U>(id, matrices, public_inputs, private_witness);
+        self.prove_inner::<N, R>(net, state)
+    }
+
+    /// Like [`Self::prove`], but creates the MPC state with `init_state` (which may involve
+    /// network rounds, e.g. for preprocessing correlated randomness) on a separate thread,
+    /// concurrently with the constraint evaluation and upload. Those do not use the network,
+    /// so the state's setup latency is hidden behind the host work. `id` must be the party
+    /// id the created state will have.
+    fn prove_with_state_init<
+        N: Network,
+        R: R1CSToQAP,
+        U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
+    >(
+        &mut self,
+        net: &N,
+        id: <T::State as MpcState>::PartyID,
+        init_state: impl FnOnce() -> eyre::Result<T::State> + Send,
+        matrices: &ConstraintMatrices<B::ArkScalarField>,
+        public_inputs: &[B::ArkScalarField],
+        private_witness: &[U::ArithmeticShare],
+    ) -> eyre::Result<ark_groth16::Proof<B::ArkPairing>>
+    where
+        U::ArithmeticShare: Sync,
+    {
+        let id = Self::cast_party_id::<U>(id);
+        let mut state = std::thread::scope(|s| {
+            let state = s.spawn(init_state);
+            self.upload_inputs::<U>(id, matrices, public_inputs, private_witness);
+            state
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })?;
+
+        self.prove_inner::<N, R>(net, &mut state)
+    }
+
+    fn cast_party_id<U: co_groth16::CircomGroth16Prover<B::ArkPairing>>(
+        id: <T::State as MpcState>::PartyID,
+    ) -> <U::State as MpcState>::PartyID {
         // SAFETY: matching GPU/CPU driver pairs use the same PartyID type
-        let id = unsafe {
-            transmute::<&<T::State as MpcState>::PartyID, &<U::State as MpcState>::PartyID>(&id)
-        };
-        let eval_a = evaluate_constraint::<B::ArkPairing, U>(
-            *id,
-            &matrices.a,
-            public_inputs,
-            private_witness,
-        );
-        T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a, 0);
+        unsafe {
+            *transmute::<&<T::State as MpcState>::PartyID, &<U::State as MpcState>::PartyID>(&id)
+        }
+    }
 
-        let eval_b = evaluate_constraint::<B::ArkPairing, U>(
-            *id,
-            &matrices.b,
-            public_inputs,
-            private_witness,
-        );
-        T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b, 0);
+    /// Evaluates the constraints on the host and uploads them, together with the witness and
+    /// public inputs, into the pre-allocated device buffers.
+    ///
+    /// Each upload runs on its own thread so that it overlaps with the host-side evaluation
+    /// of the next matrix: the witness and public inputs (which need no evaluation) upload
+    /// while `A` is evaluated, `A` uploads while `B` is evaluated, and so on.
+    fn upload_inputs<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static>(
+        &mut self,
+        id: <U::State as MpcState>::PartyID,
+        matrices: &ConstraintMatrices<B::ArkScalarField>,
+        public_inputs: &[B::ArkScalarField],
+        private_witness: &[U::ArithmeticShare],
+    ) where
+        U::ArithmeticShare: Sync,
+    {
+        let setup_timer = std::time::Instant::now();
+        // `combined_scalars` holds `public_inputs[1..] ++ private_witness`; the witness goes
+        // straight into its private segment, where the MSMs read it from directly.
+        let pub_len = self.prepared_key.num_instance_variables - 1;
+        let device = icicle_runtime::get_active_device().expect("Failed to get active device");
+        let Self {
+            eval_a: eval_a_buf,
+            eval_b: eval_b_buf,
+            eval_c: eval_c_buf,
+            combined_scalars,
+            public_inputs: public_inputs_buf,
+            ..
+        } = self;
 
-        if let Some(eval_c_buf) = self.eval_c.as_mut() {
-            let eval_c = evaluate_constraint_half_share::<B::ArkPairing, U>(
-                *id,
-                &matrices.c,
+        // Scoped threads are joined (and their panics propagated) when the scope ends.
+        std::thread::scope(|s| {
+            s.spawn(on_device(&device, || {
+                T::shares_to_half_share_device_into::<B, U>(
+                    private_witness,
+                    combined_scalars,
+                    pub_len,
+                );
+                ark_scalars_to_device_into(public_inputs, public_inputs_buf);
+            }));
+
+            let eval_a = evaluate_constraint::<B::ArkPairing, U>(
+                id,
+                &matrices.a,
                 public_inputs,
                 private_witness,
             );
-            T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf, 0);
-        }
+            s.spawn(on_device(&device, move || {
+                T::shares_to_device_into::<B, U>(&eval_a, eval_a_buf, 0);
+            }));
 
-        // Upload the private witness straight into `combined_scalars`'s private segment,
-        // where the `a`/`b_g1`/`b_g2`/`l` MSMs read it from directly (see
-        // `launch_witness_independent_msms`); no separate witness buffer or copy needed.
-        let pub_len = self.prepared_key.num_instance_variables - 1;
-        T::shares_to_half_share_device_into::<B, U>(
-            private_witness,
-            &mut self.combined_scalars,
-            pub_len,
-        );
-        ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
+            let eval_b = evaluate_constraint::<B::ArkPairing, U>(
+                id,
+                &matrices.b,
+                public_inputs,
+                private_witness,
+            );
+            s.spawn(on_device(&device, move || {
+                T::shares_to_device_into::<B, U>(&eval_b, eval_b_buf, 0);
+            }));
+
+            // Nothing is left to overlap with, so `C` is uploaded on this thread.
+            if let Some(eval_c_buf) = eval_c_buf.as_mut() {
+                let eval_c = evaluate_constraint_half_share::<B::ArkPairing, U>(
+                    id,
+                    &matrices.c,
+                    public_inputs,
+                    private_witness,
+                );
+                T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf, 0);
+            }
+        });
 
         tracing::info!(
             "Constraint evaluation + device upload took {} ms",
             setup_timer.elapsed().as_millis()
         );
-
-        self.prove_inner::<N, R>(net, state)
     }
 
     /// Computes the QAP witness and creates the proof from the uploaded inputs.
@@ -749,7 +837,8 @@ impl<P: ark_ec::pairing::Pairing> ShamirCoGroth16<P> {
     /// `num_parties` must be at least `2 * threshold + 1`, since `g_c` is opened as a
     /// degree-`2*threshold` sharing.
     ///
-    /// Correlated randomness is preprocessed over `net` before the online phase.
+    /// Correlated randomness is preprocessed over `net` concurrently with the constraint
+    /// evaluation and device upload.
     ///
     /// This is a one-shot convenience wrapper around [`ShamirCoGroth16Prover`]; to amortize
     /// GPU setup cost over multiple proofs, construct a [`ShamirCoGroth16Prover`] once and
@@ -838,13 +927,14 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> Rep3CoGroth16Prover<P, R> {
             private_witness
         );
 
-        let mut state = Rep3State::new(net, A2BType::default())?;
+        let id = net.id().try_into().context("not a valid party id")?;
 
         let proof = self
             .inner
-            .prove::<N, R, co_groth16::mpc::Rep3Groth16Driver>(
+            .prove_with_state_init::<N, R, co_groth16::mpc::Rep3Groth16Driver>(
                 net,
-                &mut state,
+                id,
+                || Rep3State::new(net, A2BType::default()),
                 matrices,
                 public_inputs,
                 witness,
@@ -993,18 +1083,25 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> ShamirCoGroth16Prover<P, R> {
         // call, discarded afterwards, exactly matching upstream's one-shot behavior -- see
         // the struct docs for why this must stay the default.
         if !self.persist_shamir_state {
-            let preprocessing = ShamirPreprocessing::new(
-                self.num_parties,
-                self.threshold,
-                SHAMIR_PAIRS_PER_PROOF,
-                net,
-            )?;
-            let mut state = ShamirState::from(preprocessing);
+            let (num_parties, threshold) = (self.num_parties, self.threshold);
+            // Runs concurrently with the constraint evaluation and upload, hiding its network
+            // rounds.
+            let init_state = || {
+                let timer = std::time::Instant::now();
+                let preprocessing =
+                    ShamirPreprocessing::new(num_parties, threshold, SHAMIR_PAIRS_PER_PROOF, net)?;
+                tracing::debug!(
+                    "Shamir preprocessing took {} ms",
+                    timer.elapsed().as_millis()
+                );
+                Ok(ShamirState::from(preprocessing))
+            };
             let proof = self
                 .inner
-                .prove::<N, R, co_groth16::mpc::ShamirGroth16Driver>(
+                .prove_with_state_init::<N, R, co_groth16::mpc::ShamirGroth16Driver>(
                     net,
-                    &mut state,
+                    net.id(),
+                    init_state,
                     matrices,
                     public_inputs,
                     witness,

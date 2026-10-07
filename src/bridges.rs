@@ -97,12 +97,21 @@ pub(crate) fn ark_scalars_to_device_into_at<T, I>(
     // SAFETY: Reinterpreting Arkworks field elements as Icicle-specific scalars
     let icicle_scalars = unsafe { transmute::<&[T], &[I]>(ark_scalars) };
     let dst_slice: &mut DeviceSlice<I> = &mut dst[start..end];
+    let timer = std::time::Instant::now();
     dst_slice
         .copy_from_host(icicle_runtime::memory::HostSlice::from_slice(
             icicle_scalars,
         ))
         .expect("Failed to copy data from host to device");
+    let copy_time = timer.elapsed();
+    // Synchronous: the null stream makes Icicle wait for the conversion to finish.
     I::from_mont(dst_slice, &IcicleStream::default());
+    tracing::debug!(
+        len = ark_scalars.len(),
+        "Upload: host-to-device copy took {} µs, from_mont took {} µs",
+        copy_time.as_micros(),
+        (timer.elapsed() - copy_time).as_micros()
+    );
 }
 
 pub(crate) fn ark_to_icicle_scalar<T, I>(ark_scalar: T) -> I

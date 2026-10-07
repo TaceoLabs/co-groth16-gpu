@@ -30,7 +30,7 @@ pub trait CircomGroth16Prover<
     type ArithmeticShare: Send;
 
     /// Represents a vector of field shares on the device
-    type DeviceShares;
+    type DeviceShares: Send;
 
     /// Represents a vector of point shares on the device
     type DevicePointShares<C: Curve<ScalarField = F>>;
