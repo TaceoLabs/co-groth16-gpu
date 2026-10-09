@@ -73,6 +73,10 @@ where
 
     type State = ShamirState<Fr>;
 
+    fn single_device_vec(shares: &mut Self::DeviceShares) -> Option<&mut DeviceVec<F>> {
+        Some(shares)
+    }
+
     fn to_half_share(a: &Self::ArithmeticShare) -> F {
         *a
     }

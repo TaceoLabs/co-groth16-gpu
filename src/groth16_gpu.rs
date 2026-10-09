@@ -5,14 +5,14 @@ use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
 use icicle_core::curve::{Affine, Curve, Projective};
-use icicle_runtime::memory::DeviceVec;
+use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
 use mpc_core::protocols::shamir::{ShamirPreprocessing, ShamirPrimeFieldShare, ShamirState};
 use mpc_net::Network;
 use std::sync::Arc;
-use std::{marker::PhantomData, mem::transmute};
+use std::{marker::PhantomData, mem::transmute, ops::IndexMut};
 
 use icicle_core::msm::MSM;
 
@@ -22,6 +22,7 @@ use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
 use crate::mpc::shamir::ShamirGroth16Driver;
+use crate::spmv::{self, DeviceMatrix};
 use crate::utils::{evaluate_constraint, evaluate_constraint_half_share};
 
 use reduction::ReductionScratch;
@@ -68,6 +69,25 @@ struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScala
     eval_c: Option<DeviceVec<B::IcicleScalarField>>,
     witness_half_shares: DeviceVec<B::IcicleScalarField>,
     public_inputs: DeviceVec<B::IcicleScalarField>,
+    /// The `A` and `B` matrices on the device, if the constraints are evaluated there.
+    device_matrices: Option<DeviceMatrices<B::IcicleScalarField>>,
+}
+
+/// The `A` and `B` constraint matrices on the device, uploaded by the first proof since the
+/// prepared key does not hold them.
+struct DeviceMatrices<F> {
+    a: DeviceMatrix<F>,
+    b: DeviceMatrix<F>,
+    /// Identifies the host matrices the device ones were uploaded from, so that proving with
+    /// other matrices uploads those instead of silently using stale ones.
+    source: [(usize, usize); 2],
+}
+
+fn matrices_source<F: ark_ff::Field>(matrices: &ConstraintMatrices<F>) -> [(usize, usize); 2] {
+    [
+        (matrices.a.as_ptr() as usize, matrices.a.len()),
+        (matrices.b.as_ptr() as usize, matrices.b.len()),
+    ]
 }
 
 pub type Bn254PreparedKey = ProvingKey<
@@ -127,6 +147,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             eval_c: requires_eval_c.then(|| alloc(domain_size)),
             witness_half_shares: alloc(prepared_key.num_witness_variables),
             public_inputs: alloc(prepared_key.num_instance_variables),
+            device_matrices: None,
             prepared_key,
         }
     }
@@ -154,23 +175,47 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         };
         let domain_size = self.prepared_key.domain_size;
 
-        let eval_a = evaluate_constraint::<B::ArkPairing, U>(
-            *id,
-            domain_size,
-            &matrices.a,
-            public_inputs,
-            private_witness,
-        );
-        T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a);
+        // Uploaded first: `A` and `B` are evaluated from them when that happens on the device.
+        T::shares_to_half_share_device_into::<B, U>(private_witness, &mut self.witness_half_shares);
+        ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
 
-        let eval_b = evaluate_constraint::<B::ArkPairing, U>(
-            *id,
-            domain_size,
-            &matrices.b,
-            public_inputs,
-            private_witness,
-        );
-        T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b);
+        if self.update_device_matrices(matrices) {
+            let num_constraints = self.prepared_key.num_constraints;
+            let DeviceMatrices { a, b, .. } = self.device_matrices.as_ref().unwrap();
+            let stream = &self.streams.g1;
+            for (matrix, evals) in [(a, &mut self.eval_a), (b, &mut self.eval_b)] {
+                let evals = T::single_device_vec(evals).unwrap();
+                evals
+                    .index_mut(num_constraints..)
+                    .memset(0, domain_size - num_constraints)
+                    .expect("Failed to zero device buffer tail");
+                matrix.mul_vec(
+                    &self.public_inputs,
+                    &self.witness_half_shares,
+                    &mut evals[..num_constraints],
+                    stream,
+                );
+            }
+            stream.synchronize().unwrap();
+        } else {
+            let eval_a = evaluate_constraint::<B::ArkPairing, U>(
+                *id,
+                domain_size,
+                &matrices.a,
+                public_inputs,
+                private_witness,
+            );
+            T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a);
+
+            let eval_b = evaluate_constraint::<B::ArkPairing, U>(
+                *id,
+                domain_size,
+                &matrices.b,
+                public_inputs,
+                private_witness,
+            );
+            T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b);
+        }
 
         if let Some(eval_c_buf) = self.eval_c.as_mut() {
             let eval_c = evaluate_constraint_half_share::<B::ArkPairing, U>(
@@ -183,15 +228,30 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf);
         }
 
-        T::shares_to_half_share_device_into::<B, U>(private_witness, &mut self.witness_half_shares);
-        ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
-
         tracing::info!(
             "Constraint evaluation + device upload took {} ms",
             setup_timer.elapsed().as_millis()
         );
 
         self.prove_inner::<N, R>(net, state)
+    }
+
+    /// Makes sure `self.device_matrices` holds `matrices` if the constraints can be evaluated
+    /// on the device, i.e. the CUDA kernels were built and a share is a single field
+    /// element (not with Rep3). Returns whether they can.
+    fn update_device_matrices(&mut self, matrices: &ConstraintMatrices<B::ArkScalarField>) -> bool {
+        if !spmv::available() || T::single_device_vec(&mut self.eval_a).is_none() {
+            return false;
+        }
+        let source = matrices_source(matrices);
+        if self.device_matrices.as_ref().map(|m| m.source) != Some(source) {
+            self.device_matrices = Some(DeviceMatrices {
+                a: DeviceMatrix::new(&matrices.a),
+                b: DeviceMatrix::new(&matrices.b),
+                source,
+            });
+        }
+        true
     }
 
     /// Computes the QAP witness and creates the proof from the uploaded inputs.

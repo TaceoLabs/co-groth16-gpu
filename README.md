@@ -6,7 +6,11 @@ This project depends on the **ICICLE** native backend from the
 Because the backend must be compiled with specific flags you must perform the setup manually before 
 running the code or tests.
 
-_TODO: build.rs_
+The R1CS constraints are evaluated on the GPU by a CUDA kernel (`src/cuda/spmv.cu`). It is
+checked in as PTX (`src/cuda/spmv.ptx`) and loaded through the CUDA driver at runtime, so
+building the crate needs no CUDA toolchain. After changing the kernel, regenerate the PTX with
+`scripts/build-ptx.sh` (needs `nvcc`) and commit it. The driver must support the CUDA version
+the PTX was generated with (currently 12.8, i.e. driver 570 or newer).
 
 ---
 

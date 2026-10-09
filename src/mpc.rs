@@ -66,6 +66,12 @@ pub trait CircomGroth16Prover<
         mul_scalars(coeffs_in, roots, coeffs.as_mut_slice(), &cfg).unwrap();
     }
 
+    /// The shares as one device vector, if a share is a single field element (unlike e.g.
+    /// Rep3's pairs), so that they can be computed with device-side linear algebra.
+    fn single_device_vec(_shares: &mut Self::DeviceShares) -> Option<&mut DeviceVec<F>> {
+        None
+    }
+
     /// Converts a shared value to a half shared value. Local interaction only.
     fn to_half_share(a: &Self::ArithmeticShare) -> F;
 

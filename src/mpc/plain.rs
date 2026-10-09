@@ -36,6 +36,10 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     type DevicePointShares<C: Curve<ScalarField = F>> = DeviceVec<Affine<C>>;
 
     type State = ();
+    fn single_device_vec(shares: &mut Self::DeviceShares) -> Option<&mut DeviceVec<F>> {
+        Some(shares)
+    }
+
     fn to_half_share(a: &Self::ArithmeticShare) -> F {
         *a
     }
