@@ -20,7 +20,10 @@ use std::{marker::PhantomData, mem::transmute, ops::IndexMut};
 
 use icicle_core::msm::MSM;
 
-use crate::bridges::{ArkIcicleBridge, Bn254Bridge, ark_scalars_to_device_into};
+use crate::bridges::{
+    ArkIcicleBridge, Bn254Bridge, ark_scalars_to_device_into, ark_to_icicle_affine,
+    icicle_to_ark_scalar,
+};
 use crate::gpu_utils::{Proof, ProofStreams, ProvingKey, VerifyingKey};
 use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
@@ -31,6 +34,7 @@ use crate::spmv::DeviceMatrix;
 use crate::utils::{
     evaluate_constraint, evaluate_constraint_half_share, root_of_unity_for_groth16,
 };
+use ark_ec::CurveGroup;
 
 use reduction::ReductionScratch;
 pub use reduction::{CircomReduction, LibSnarkReduction, R1CSToQAP};
@@ -119,6 +123,16 @@ impl<B: ArkIcicleBridge> DeviceMsms<B> {
             sorted: Event::new(),
         })
     }
+}
+
+/// The proof terms that only depend on the randomness `r` and `s`, as half shares.
+struct Blinding<B: ArkIcicleBridge> {
+    r_hs: B::IcicleScalarField,
+    s_hs: B::IcicleScalarField,
+    delta_r_g1: Projective<B::IcicleG1>,
+    delta_s_g1: Projective<B::IcicleG1>,
+    delta_s_g2: Projective<B::IcicleG2>,
+    delta_rs_g1: Projective<B::IcicleG1>,
 }
 
 /// The number of MSMs in the G1 batch, see [`ProvingKey::g1_batch_bases`].
@@ -277,6 +291,9 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let domain_size = self.prepared_key.domain_size;
         let num_constraints = self.prepared_key.num_constraints;
 
+        let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
+        let mut blinding = None;
+
         // Nothing runs on the device yet, so these may be synchronous.
         ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
         self.upload_msm_scalars::<U>(adds_public, public_inputs, private_witness);
@@ -304,7 +321,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let msm_size = msm_scalars.len() / G1_BATCH_SIZE;
         let pub_len = public_inputs.len() - 1;
 
-        std::thread::scope(|s| -> eyre::Result<()> {
+        std::thread::scope(|scope| -> eyre::Result<()> {
             // The `a`, `b_g1` and `l` MSMs as one batch, and `b_g2` on another stream.
             let msms = if let Some(m) = device_msms.as_mut() {
                 m.witness.sort(&msm_scalars[..msm_size], &streams.g1);
@@ -329,7 +346,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 );
                 None
             } else {
-                Some(s.spawn(on_device(&device, || {
+                Some(scope.spawn(on_device(&device, || {
                     msm_into(
                         &key.g1_batch_bases,
                         msm_scalars,
@@ -393,6 +410,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 T::half_shares_to_device_into::<B, U>(&eval, eval_c_buf);
             }
             T::write_trivial_shares_into(t_id, public_inputs_buf, eval_a, num_constraints, stream);
+            // While the device evaluates the constraints.
+            blinding = Some(Self::blinding(key, state, r, s));
             stream.synchronize().unwrap();
             tracing::info!(
                 "Constraint evaluation + device upload took {} ms",
@@ -441,8 +460,32 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             Ok(())
         })?;
 
-        let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
-        self.finish_proof(net, state, r, s)
+        self.finish_proof(net, state, blinding.unwrap())
+    }
+
+    /// The terms that only depend on `r` and `s`: host scalar multiplications are slow.
+    fn blinding(
+        key: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>,
+        state: &mut T::State,
+        r: T::ArithmeticShare,
+        s: T::ArithmeticShare,
+    ) -> Blinding<B> {
+        let delta_g1 = key.delta_g1.to_projective();
+        let delta_g2 = key.vk.delta_g2.to_projective();
+        let (r_hs, s_hs) = (T::to_half_share(&r), T::to_half_share(&s));
+        let rs = T::local_mul::<B>(&r, &s, state);
+        let ((delta_r_g1, delta_s_g1), (delta_s_g2, delta_rs_g1)) = rayon::join(
+            || rayon::join(|| delta_g1 * r_hs, || delta_g1 * s_hs),
+            || rayon::join(|| delta_g2 * s_hs, || delta_g1 * rs),
+        );
+        Blinding {
+            r_hs,
+            s_hs,
+            delta_r_g1,
+            delta_s_g1,
+            delta_s_g2,
+            delta_rs_g1,
+        }
     }
 
     /// Writes `public_inputs[1..] ++ witness` into every copy in `self.msm_scalars`. A party that
@@ -519,27 +562,28 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         &mut self,
         net: &N,
         state: &mut T::State,
-        r: T::ArithmeticShare,
-        s: T::ArithmeticShare,
+        blinding: Blinding<B>,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let total_timer = std::time::Instant::now();
         let ProvingKey {
             vk,
             beta_g1,
-            delta_g1,
             a_query_first,
             b_g1_query_first,
             b_g2_query_first,
             ..
         } = self.prepared_key.as_ref();
         let VerifyingKey {
-            alpha_g1,
-            beta_g2,
-            delta_g2,
-            ..
+            alpha_g1, beta_g2, ..
         } = vk;
-        let delta_g1 = delta_g1.to_projective();
-        let delta_g2 = delta_g2.to_projective();
+        let Blinding {
+            r_hs,
+            s_hs,
+            delta_r_g1,
+            delta_s_g1,
+            delta_s_g2,
+            delta_rs_g1,
+        } = blinding;
         let id = state.id();
         let streams = &self.streams;
 
@@ -555,19 +599,17 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             total_timer.elapsed().as_millis()
         );
 
-        let r_hs = T::to_half_share(&r);
         let g_a = Self::calculate_coeff::<B::IcicleG1>(
             id,
-            (delta_g1 * r_hs).into(),
+            delta_r_g1.into(),
             *a_query_first,
             *alpha_g1,
             acc_r_g1.into(),
         );
         // In original implementation this is skipped if r==0, however r is shared in our case
-        let s_hs = T::to_half_share(&s);
         let g1_b = Self::calculate_coeff::<B::IcicleG1>(
             id,
-            (delta_g1 * s_hs).into(),
+            delta_s_g1.into(),
             *b_g1_query_first,
             *beta_g1,
             acc_s_g1.into(),
@@ -577,6 +619,13 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         // scalar multiplication, so both values can be opened in a single round.
         let (g_a_opened, g1_b_opened) = T::open_two_half_points_g1::<_, B>(g_a, g1_b, net, state)
             .expect("Failed to open g_a and g1_b");
+        // arkworks multiplies faster than Icicle on the host.
+        let mul = |p: Affine<B::IcicleG1>, k: B::IcicleScalarField| {
+            let k = icicle_to_ark_scalar::<B::ArkScalarField, _>(k);
+            ark_to_icicle_affine::<_, B::IcicleG1>(&(B::icicle_to_ark_g1(p) * k).into_affine())
+                .to_projective()
+        };
+        let (a_s, b_r) = rayon::join(|| mul(g_a_opened, s_hs), || mul(g1_b_opened, r_hs));
 
         let mut h_acc = [Projective::<B::IcicleG1>::zero()];
         self.h_result
@@ -591,17 +640,12 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
 
         let g2_b = Self::calculate_coeff::<B::IcicleG2>(
             id,
-            (delta_g2 * s_hs).into(),
+            delta_s_g2.into(),
             *b_g2_query_first,
             *beta_g2,
             acc_s_g2[0].into(),
         );
-        let rs = T::local_mul::<B>(&r, &s, state);
-        let mut g_c = g_a_opened.to_projective() * s_hs;
-        g_c = g_c + g1_b_opened.to_projective() * r_hs;
-        g_c = g_c - delta_g1 * rs;
-        g_c = g_c + l_acc;
-        g_c = g_c + h_acc[0];
+        let g_c = a_s + b_r - delta_rs_g1 + l_acc + h_acc[0];
         let (g_c_opened, g2_b_opened) =
             T::open_two_half_points_g1g2::<_, B>(g_c.into(), g2_b, net, state)?;
         tracing::info!(

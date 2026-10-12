@@ -15,7 +15,7 @@ use icicle_runtime::{
 use mpc_core::{
     MpcState,
     protocols::shamir::{
-        ShamirPrimeFieldShare, ShamirState, arithmetic, network::ShamirNetworkExt, pointshare,
+        ShamirPrimeFieldShare, ShamirState, arithmetic, network::ShamirNetworkExt,
     },
 };
 use mpc_net::Network;
@@ -59,6 +59,44 @@ fn cast_state<Fr: PrimeField + 'static, ArkF: PrimeField + 'static>(
     (state as &mut dyn std::any::Any)
         .downcast_mut::<ShamirState<ArkF>>()
         .expect("Invalid bridge: ArkScalarField does not match driver's scalar field")
+}
+
+/// `mpc_core`'s `reconstruct_point`, multiplying by the smaller of each coefficient and its
+/// negation: the coefficients are small integers (3, -3, 1 for three parties).
+fn reconstruct_point<C: CurveGroup>(shares: &[C], lagrange: &[C::ScalarField]) -> C {
+    assert_eq!(shares.len(), lagrange.len());
+    shares
+        .iter()
+        .zip(lagrange)
+        .map(|(s, l)| {
+            let (pos, neg) = (l.into_bigint(), (-*l).into_bigint());
+            if neg < pos {
+                -s.mul_bigint(neg)
+            } else {
+                s.mul_bigint(pos)
+            }
+        })
+        .sum()
+}
+
+/// `mpc_core`'s `open_two_half_points`, with the faster reconstruction.
+fn open_two_half_points<C1, C2, N>(
+    a: C1,
+    b: C2,
+    net: &N,
+    state: &ShamirState<C1::ScalarField>,
+) -> eyre::Result<(C1, C2)>
+where
+    C1: CurveGroup,
+    C2: CurveGroup<ScalarField = C1::ScalarField>,
+    N: Network,
+{
+    let rcv = net.broadcast_next(state.num_parties, state.threshold * 2 + 1, (a, b))?;
+    let (rcv_a, rcv_b): (Vec<_>, Vec<_>) = rcv.into_iter().unzip();
+    Ok(rayon::join(
+        || reconstruct_point(&rcv_a, &state.open_lagrange_2t),
+        || reconstruct_point(&rcv_b, &state.open_lagrange_2t),
+    ))
 }
 
 impl<F, Fr> CircomGroth16Prover<F> for ShamirGroth16Driver<Fr>
@@ -230,8 +268,7 @@ where
         let ark_a = B::icicle_to_ark_g1(a);
         let ark_b = B::icicle_to_ark_g1(b);
         let state = cast_state::<Fr, B::ArkScalarField>(state);
-        let (open_a, open_b) =
-            pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net, state)?;
+        let (open_a, open_b) = open_two_half_points(ark_a.into(), ark_b.into(), net, state)?;
         Ok((
             ark_to_icicle_affine(&open_a.into_affine()),
             ark_to_icicle_affine(&open_b.into_affine()),
@@ -247,8 +284,7 @@ where
         let ark_a = B::icicle_to_ark_g1(a);
         let ark_b = B::icicle_to_ark_g2(b);
         let state = cast_state::<Fr, B::ArkScalarField>(state);
-        let (open_a, open_b) =
-            pointshare::open_two_half_points(ark_a.into(), ark_b.into(), net, state)?;
+        let (open_a, open_b) = open_two_half_points(ark_a.into(), ark_b.into(), net, state)?;
         Ok((
             ark_to_icicle_affine(&open_a.into_affine()),
             ark_to_icicle_affine(&open_b.into_affine()),
