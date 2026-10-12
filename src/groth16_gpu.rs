@@ -1,12 +1,12 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
 use crate::cuda::retain_freed_device_memory;
-use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, get_first, msm_async};
+use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, msm_into};
 use ark_bn254::Bn254;
 use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
 use icicle_core::curve::{Affine, Curve, Projective};
-use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
+use icicle_runtime::memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice};
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
 use mpc_core::protocols::rep3::{Rep3PrimeFieldShare, Rep3State};
@@ -68,10 +68,36 @@ struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScala
     eval_b: T::DeviceShares,
     /// Only allocated when the reduction requires the evaluation of the `C` matrix.
     eval_c: Option<DeviceVec<B::IcicleScalarField>>,
-    witness_half_shares: DeviceVec<B::IcicleScalarField>,
     public_inputs: DeviceVec<B::IcicleScalarField>,
+    /// The scalars of the batched G1 MSM over [`ProvingKey::g1_batch_bases`]: one copy of
+    /// `public_inputs[1..] ++ witness` per MSM of the batch, since Icicle cannot share the
+    /// scalars within a batch. The first copy also serves the `b_g2` MSM.
+    msm_scalars: DeviceVec<B::IcicleScalarField>,
+    /// The MSM results: the G1 batch (`a`, `b_g1`, `l`), then `h`.
+    g1_results: DeviceVec<Projective<B::IcicleG1>>,
+    g2_result: DeviceVec<Projective<B::IcicleG2>>,
     /// The `A` and `B` matrices on the device, if the constraints are evaluated there.
     device_matrices: Option<DeviceMatrices<B::IcicleScalarField>>,
+}
+
+/// The number of MSMs in the G1 batch, see [`ProvingKey::g1_batch_bases`].
+const G1_BATCH_SIZE: usize = 3;
+
+/// `slice.split_at_mut(mid)` for device memory.
+fn split_device_slice_mut<T>(
+    slice: &mut DeviceSlice<T>,
+    mid: usize,
+) -> (&mut DeviceSlice<T>, &mut DeviceSlice<T>) {
+    let len = slice.len();
+    assert!(mid <= len);
+    // SAFETY: the halves are disjoint subranges of `slice`, which they borrow mutably.
+    unsafe {
+        let ptr = slice.as_mut_ptr();
+        (
+            DeviceSlice::from_mut_slice(std::slice::from_raw_parts_mut(ptr, mid)),
+            DeviceSlice::from_mut_slice(std::slice::from_raw_parts_mut(ptr.add(mid), len - mid)),
+        )
+    }
 }
 
 /// The `A` and `B` constraint matrices on the device, uploaded by the first proof since the
@@ -147,8 +173,15 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             eval_a: T::alloc_device_shares(domain_size),
             eval_b: T::alloc_device_shares(domain_size),
             eval_c: requires_eval_c.then(|| alloc(domain_size)),
-            witness_half_shares: alloc(prepared_key.num_witness_variables),
             public_inputs: alloc(prepared_key.num_instance_variables),
+            msm_scalars: alloc(
+                G1_BATCH_SIZE
+                    * (prepared_key.num_instance_variables - 1
+                        + prepared_key.num_witness_variables),
+            ),
+            g1_results: DeviceVec::device_malloc(G1_BATCH_SIZE + 1)
+                .expect("Failed to allocate MSM results"),
+            g2_result: DeviceVec::device_malloc(1).expect("Failed to allocate MSM result"),
             device_matrices: None,
             prepared_key,
         }
@@ -170,6 +203,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         private_witness: &[U::ArithmeticShare],
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let setup_timer = std::time::Instant::now();
+        let adds_public = T::adds_public_values(state.id());
         let id = state.id();
         // SAFETY: matching GPU/CPU driver pairs use the same PartyID type
         let id = unsafe {
@@ -178,8 +212,10 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let domain_size = self.prepared_key.domain_size;
 
         // Uploaded first: `A` and `B` are evaluated from them when that happens on the device.
-        T::shares_to_half_share_device_into::<B, U>(private_witness, &mut self.witness_half_shares);
         ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
+        self.upload_msm_scalars::<U>(adds_public, public_inputs, private_witness);
+        let msm_size = self.msm_scalars.len() / G1_BATCH_SIZE;
+        let pub_len = public_inputs.len() - 1;
 
         if self.update_device_matrices(matrices) {
             let num_constraints = self.prepared_key.num_constraints;
@@ -193,7 +229,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                     .expect("Failed to zero device buffer tail");
                 matrix.mul_vec(
                     &self.public_inputs,
-                    &self.witness_half_shares,
+                    &self.msm_scalars[pub_len..msm_size],
                     &mut evals[..num_constraints],
                     stream,
                 );
@@ -236,6 +272,37 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         );
 
         self.prove_inner::<N, R>(net, state)
+    }
+
+    /// Writes `public_inputs[1..] ++ witness` into every copy in `self.msm_scalars`. A party that
+    /// does not add public values (see [`CircomGroth16Prover::adds_public_values`]) writes zeros
+    /// for the public inputs, so that they still count exactly once in the reconstruction.
+    fn upload_msm_scalars<U: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static>(
+        &mut self,
+        adds_public: bool,
+        public_inputs: &[B::ArkScalarField],
+        private_witness: &[U::ArithmeticShare],
+    ) {
+        let msm_size = self.msm_scalars.len() / G1_BATCH_SIZE;
+        let pub_len = public_inputs.len() - 1;
+        let (first, copies) = split_device_slice_mut(&mut self.msm_scalars, msm_size);
+        {
+            let (public, witness) = split_device_slice_mut(first, pub_len);
+            if adds_public {
+                ark_scalars_to_device_into(&public_inputs[1..], public);
+            } else {
+                public
+                    .memset(0, pub_len)
+                    .expect("Failed to zero device buffer");
+            }
+            T::shares_to_half_share_device_into::<B, U>(private_witness, witness);
+        }
+        for i in 0..G1_BATCH_SIZE - 1 {
+            copies
+                .index_mut(i * msm_size..(i + 1) * msm_size)
+                .copy(first)
+                .expect("Failed to copy MSM scalars");
+        }
     }
 
     /// Makes sure `self.device_matrices` holds `matrices` if the constraints can be evaluated
@@ -284,13 +351,15 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         self.create_proof_with_assignment(net, state, r, s)
     }
 
+    /// `initial + first_query + vk_param + acc`, where the public `first_query` and `vk_param`
+    /// are only added by the parties that may, and `acc` is an MSM result over scalars that
+    /// already account for that (see [`Self::upload_msm_scalars`]).
     fn calculate_coeff<C>(
         id: <T::State as MpcState>::PartyID,
         initial: Affine<C>,
         first_query: Affine<C>,
         vk_param: Affine<C>,
-        pub_acc: Affine<C>,
-        priv_acc: Affine<C>,
+        acc: Affine<C>,
     ) -> Affine<C>
     where
         C: Curve<ScalarField = B::IcicleScalarField> + MSM<C>,
@@ -298,21 +367,18 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let mut res = initial;
         T::add_assign_points_public_hs::<C>(id, &mut res, &first_query);
         T::add_assign_points_public_hs::<C>(id, &mut res, &vk_param);
-        T::add_assign_points_public_hs::<C>(id, &mut res, &pub_acc);
-        (res.to_projective() + priv_acc.to_projective()).into()
+        (res.to_projective() + acc.to_projective()).into()
     }
 
     /// Creates the proof from the QAP witness left in `self.scratch.h` by the reduction.
     fn create_proof_with_assignment<N: Network>(
-        &self,
+        &mut self,
         net: &N,
         state: &mut T::State,
         r: T::ArithmeticShare,
         s: T::ArithmeticShare,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let h = &self.scratch.h;
-        let input_assignment = &self.public_inputs;
-        let aux_assignment = &self.witness_half_shares;
         let total_timer = std::time::Instant::now();
         let ProvingKey {
             vk,
@@ -321,13 +387,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             a_query_first,
             b_g1_query_first,
             b_g2_query_first,
-            a_query_pub,
-            a_query_priv,
-            b_g1_query_pub,
-            b_g1_query_priv,
-            b_g2_query_pub,
-            b_g2_query_priv,
-            l_query,
+            g1_batch_bases,
+            b_g2_query,
             h_query,
             ..
         } = self.prepared_key.as_ref();
@@ -348,59 +409,29 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let stream_g2 = &self.streams.g2;
 
         let msm_timer = std::time::Instant::now();
-        // Compute A
-        let (pub_acc_r_g1, priv_acc_r_g1) = (
-            msm_async(
-                a_query_pub,
-                &input_assignment[1..],
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-            msm_async(
-                a_query_priv,
-                aux_assignment,
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
+        let msm_size = self.msm_scalars.len() / G1_BATCH_SIZE;
+        // The `a`, `b_g1` and `l` MSMs as one batch, then `h`, and `b_g2` on the other stream.
+        msm_into(
+            g1_batch_bases,
+            &self.msm_scalars,
+            &mut self.g1_results[..G1_BATCH_SIZE],
+            stream_g1,
+            PRECOMPUTE_FACTOR_G1,
         );
-
-        // Compute B in G1
-        let (pub_acc_s_g1, priv_acc_s_g1) = (
-            msm_async(
-                b_g1_query_pub,
-                &input_assignment[1..],
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
-            msm_async(
-                b_g1_query_priv,
-                aux_assignment,
-                stream_g1,
-                PRECOMPUTE_FACTOR_G1,
-            ),
+        msm_into(
+            h_query,
+            h,
+            &mut self.g1_results[G1_BATCH_SIZE..],
+            stream_g1,
+            PRECOMPUTE_FACTOR_G1,
         );
-
-        // Compute B in G2
-        let (pub_acc_s_g2, priv_acc_s_g2) = (
-            msm_async(
-                b_g2_query_pub,
-                &input_assignment[1..],
-                stream_g2,
-                PRECOMPUTE_FACTOR_G2,
-            ),
-            msm_async(
-                b_g2_query_priv,
-                aux_assignment,
-                stream_g2,
-                PRECOMPUTE_FACTOR_G2,
-            ),
+        msm_into(
+            b_g2_query,
+            &self.msm_scalars[..msm_size],
+            &mut self.g2_result[..],
+            stream_g2,
+            PRECOMPUTE_FACTOR_G2,
         );
-
-        // Compute msm(l_query, aux_assignment)
-        let l_acc = msm_async(l_query, aux_assignment, stream_g1, PRECOMPUTE_FACTOR_G1);
-
-        // Compute msm(h_query, h)
-        let h_acc = msm_async(h_query, h, stream_g1, PRECOMPUTE_FACTOR_G1);
 
         stream_g1.synchronize().unwrap();
         stream_g2.synchronize().unwrap();
@@ -410,14 +441,16 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         );
 
         let coeff_timer = std::time::Instant::now();
-        let pub_acc_r_g1 = get_first(&pub_acc_r_g1);
-        let priv_acc_r_g1 = get_first(&priv_acc_r_g1);
-        let pub_acc_s_g1 = get_first(&pub_acc_s_g1);
-        let priv_acc_s_g1 = get_first(&priv_acc_s_g1);
-        let l_acc = get_first(&l_acc);
-        let h_acc = get_first(&h_acc);
-        let pub_acc_s_g2 = get_first(&pub_acc_s_g2);
-        let priv_acc_s_g2 = get_first(&priv_acc_s_g2);
+        let mut g1_results = [Projective::<B::IcicleG1>::zero(); G1_BATCH_SIZE + 1];
+        self.g1_results
+            .copy_to_host(HostSlice::from_mut_slice(&mut g1_results))
+            .expect("Failed to read back MSM results");
+        let mut g2_result = [Projective::<B::IcicleG2>::zero()];
+        self.g2_result
+            .copy_to_host(HostSlice::from_mut_slice(&mut g2_result))
+            .expect("Failed to read back MSM result");
+        let [acc_r_g1, acc_s_g1, l_acc, h_acc] = g1_results;
+        let [acc_s_g2] = g2_result;
 
         let r_hs = T::to_half_share(&r);
         let r_g1 = delta_g1 * r_hs;
@@ -426,8 +459,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             r_g1.into(),
             *a_query_first,
             *alpha_g1,
-            pub_acc_r_g1.into(),
-            priv_acc_r_g1.into(),
+            acc_r_g1.into(),
         );
 
         // In original implementation this is skipped if r==0, however r is shared in our case
@@ -438,8 +470,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             s_g1.into(),
             *b_g1_query_first,
             *beta_g1,
-            pub_acc_s_g1.into(),
-            priv_acc_s_g1.into(),
+            acc_s_g1.into(),
         );
 
         let s_g2 = delta_g2 * s_hs;
@@ -448,8 +479,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             s_g2.into(),
             *b_g2_query_first,
             *beta_g2,
-            pub_acc_s_g2.into(),
-            priv_acc_s_g2.into(),
+            acc_s_g2.into(),
         );
 
         // Compute r * s

@@ -5,7 +5,7 @@ use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{BigInteger, PrimeField};
 use icicle_core::curve::{Affine, Curve};
 use icicle_core::traits::{Arithmetic, FieldImpl, MontgomeryConvertible};
-use icicle_runtime::memory::{DeviceVec, HostOrDeviceSlice};
+use icicle_runtime::memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice};
 
 use icicle_core::{
     msm::MSM,
@@ -66,7 +66,7 @@ where
 
 /// Uploads Arkworks scalars into the pre-allocated `dst` (which must have matching length)
 /// and converts them out of Montgomery representation on the device.
-pub(crate) fn ark_scalars_to_device_into<T, I>(ark_scalars: &[T], dst: &mut DeviceVec<I>)
+pub(crate) fn ark_scalars_to_device_into<T, I>(ark_scalars: &[T], dst: &mut DeviceSlice<I>)
 where
     T: PrimeField,
     I: FieldImpl + MontgomeryConvertible,

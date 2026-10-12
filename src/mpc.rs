@@ -127,8 +127,15 @@ pub trait CircomGroth16Prover<
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
-        dst: &mut DeviceVec<F>,
+        dst: &mut DeviceSlice<F>,
     );
+
+    /// Whether this party adds public values into linear combinations of shares, e.g. the
+    /// public inputs into the scalars of the `a`/`b`/`l` query MSMs.
+    ///
+    /// Shamir shares reconstruct with Lagrange weights that sum to one, so every party adds
+    /// them. Rep3 shares reconstruct by a plain sum, so only one party may.
+    fn adds_public_values(id: <Self::State as MpcState>::PartyID) -> bool;
 
     /// Performs element-wise multiplication of two vectors of shared values, writing the
     /// result into `result` (which must have the same length as the inputs).

@@ -139,10 +139,21 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         T: co_groth16::CircomGroth16Prover<B::ArkPairing> + 'static,
     >(
         shares: &[T::ArithmeticShare],
-        dst: &mut DeviceVec<F>,
+        dst: &mut DeviceSlice<F>,
     ) {
-        // A plain share already *is* its half share, so there's nothing to convert.
-        Self::shares_to_device_into::<B, T>(shares, dst);
+        if std::any::TypeId::of::<T>()
+            != std::any::TypeId::of::<co_groth16::mpc::PlainGroth16Driver>()
+        {
+            panic!("Invalid driver: expected PlainGroth16Driver");
+        }
+        // A share already is its half share, so there's nothing to convert.
+        // SAFETY: At this point we know the shares are safe to transmute
+        let shares = unsafe { transmute::<&[T::ArithmeticShare], &[B::ArkScalarField]>(shares) };
+        ark_scalars_to_device_into(shares, dst);
+    }
+
+    fn adds_public_values(_: <Self::State as MpcState>::PartyID) -> bool {
+        true
     }
 
     fn local_mul_vec<B: ArkIcicleBridge<IcicleScalarField = F>>(
