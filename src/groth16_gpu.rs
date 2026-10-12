@@ -1,4 +1,5 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
+use crate::cuda::retain_freed_device_memory;
 use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, get_first, msm_async};
 use ark_bn254::Bn254;
 use co_circom_types::SharedWitness;
@@ -137,6 +138,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         prepared_key: Arc<ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>>,
         requires_eval_c: bool,
     ) -> Self {
+        retain_freed_device_memory();
         let alloc = |len| DeviceVec::device_malloc(len).expect("Failed to allocate device vector");
         let domain_size = prepared_key.domain_size;
         Self {

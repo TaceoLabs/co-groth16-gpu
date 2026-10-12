@@ -2,6 +2,7 @@
 mod groth16_gpu;
 
 mod bridges;
+mod cuda;
 mod gpu_utils;
 /// This module contains the Groth16 prover trait
 pub mod mpc;

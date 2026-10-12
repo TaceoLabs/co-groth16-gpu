@@ -10,7 +10,7 @@
 
 use std::{
     collections::HashMap,
-    ffi::{CStr, c_void},
+    ffi::c_void,
     ptr::null_mut,
     sync::{Mutex, OnceLock},
 };
@@ -22,79 +22,14 @@ use icicle_runtime::{
 };
 use rayon::prelude::*;
 
+use crate::cuda::{Handle, check, driver};
+
 const PTX: &str = concat!(include_str!("cuda/spmv.ptx"), "\0");
 const THREADS_PER_BLOCK: u32 = 256;
 
 /// Whether the active device is a CUDA device, i.e. can run the kernel.
 pub(crate) fn available() -> bool {
     icicle_runtime::get_active_device().is_ok_and(|device| device.get_device_type() == "CUDA")
-}
-
-type CuResult = i32;
-type Handle = *mut c_void;
-
-/// The CUDA driver API functions used here, loaded from `libcuda` at runtime.
-struct Driver {
-    init: unsafe extern "C" fn(u32) -> CuResult,
-    device_get: unsafe extern "C" fn(*mut i32, i32) -> CuResult,
-    primary_ctx_retain: unsafe extern "C" fn(*mut Handle, i32) -> CuResult,
-    ctx_set_current: unsafe extern "C" fn(Handle) -> CuResult,
-    module_load_data: unsafe extern "C" fn(*mut Handle, *const c_void) -> CuResult,
-    module_get_function: unsafe extern "C" fn(*mut Handle, Handle, *const i8) -> CuResult,
-    launch_kernel: unsafe extern "C" fn(
-        Handle,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        Handle,
-        *mut *mut c_void,
-        *mut *mut c_void,
-    ) -> CuResult,
-}
-
-/// Resolves `name` from `lib` as a function pointer of type `T`.
-///
-/// # Safety
-/// `T` must be the function's signature.
-unsafe fn symbol<T>(lib: *mut c_void, name: &CStr) -> T {
-    assert_eq!(size_of::<T>(), size_of::<*mut c_void>());
-    // SAFETY: the caller guarantees the signature.
-    unsafe {
-        let f = libc::dlsym(lib, name.as_ptr());
-        assert!(!f.is_null(), "missing CUDA driver symbol {name:?}");
-        std::mem::transmute_copy(&f)
-    }
-}
-
-fn driver() -> &'static Driver {
-    static DRIVER: OnceLock<Driver> = OnceLock::new();
-    DRIVER.get_or_init(|| {
-        // SAFETY: the symbols are given the signatures from `cuda.h`.
-        unsafe {
-            let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-            assert!(
-                !lib.is_null(),
-                "failed to load the CUDA driver (libcuda.so.1)"
-            );
-            Driver {
-                init: symbol(lib, c"cuInit"),
-                device_get: symbol(lib, c"cuDeviceGet"),
-                primary_ctx_retain: symbol(lib, c"cuDevicePrimaryCtxRetain"),
-                ctx_set_current: symbol(lib, c"cuCtxSetCurrent"),
-                module_load_data: symbol(lib, c"cuModuleLoadData"),
-                module_get_function: symbol(lib, c"cuModuleGetFunction"),
-                launch_kernel: symbol(lib, c"cuLaunchKernel"),
-            }
-        }
-    })
-}
-
-fn check(res: CuResult, call: &str) {
-    assert_eq!(res, 0, "{call} failed with CUresult {res}");
 }
 
 /// The kernel, loaded into the primary context of a device: the context the CUDA runtime,

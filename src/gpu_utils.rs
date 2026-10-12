@@ -16,10 +16,25 @@ use icicle_runtime::{
     stream::IcicleStream,
 };
 
-pub const PRECOMPUTE_FACTOR_G1: i32 = 8;
-pub const PRECOMPUTE_FACTOR_G2: i32 = 8;
-pub const C: i32 = 0; // Lets icicle auto-pick
+pub const PRECOMPUTE_FACTOR_G1: i32 = 16;
+pub const PRECOMPUTE_FACTOR_G2: i32 = 16;
 pub const LARGE_BUCKET_FACTOR: i32 = 5;
+
+/// The MSM window size for `msm_size` points. The precomputed bases depend on it, so the
+/// precomputation and the MSMs over the bases must use the same one.
+///
+/// Icicle's default window is `log2(msm_size) - 4`, which with precomputation leaves too
+/// few buckets to keep the GPU busy: the bucket accumulation runs one thread per bucket.
+/// For 2^16 points, a window of 16 with a precompute factor of 16 is about 3x faster than
+/// the default on an A40. Above 2^18 points, a window of 17 is about 7% faster than 16 on an
+/// RTX PRO 4500 Blackwell, while 18 can be pathologically slow for some sizes.
+fn msm_window(msm_size: usize) -> i32 {
+    if msm_size > 1 << 18 {
+        17
+    } else {
+        msm_size.next_power_of_two().ilog2().clamp(1, 16) as i32
+    }
+}
 
 #[macro_export]
 macro_rules! rayon_join_5 {
@@ -57,7 +72,7 @@ fn upload_points_async<C: Curve + MSM<C>>(
     cfg.stream_handle = **stream;
     cfg.is_async = true;
     cfg.precompute_factor = precompute_factor;
-    cfg.c = C;
+    cfg.c = msm_window(points.len());
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
     let mut precomputed =
@@ -412,7 +427,7 @@ pub(crate) fn msm_async<
     cfg.stream_handle = **stream;
     cfg.is_async = true;
     cfg.precompute_factor = precompute_factor.max(1);
-    cfg.c = C;
+    cfg.c = msm_window(scalars.len());
     cfg.ext
         .set_int(CUDA_MSM_LARGE_BUCKET_FACTOR, LARGE_BUCKET_FACTOR);
 
