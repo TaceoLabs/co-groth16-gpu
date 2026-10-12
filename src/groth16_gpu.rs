@@ -27,7 +27,7 @@ use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
 use crate::mpc::shamir::ShamirGroth16Driver;
 use crate::ntt::CosetNtt;
-use crate::spmv::{self, DeviceMatrix};
+use crate::spmv::DeviceMatrix;
 use crate::utils::{
     evaluate_constraint, evaluate_constraint_half_share, root_of_unity_for_groth16,
 };
@@ -480,7 +480,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     /// on the device, i.e. the CUDA kernels were built and a share is a single field
     /// element (not with Rep3). Returns whether they can.
     fn update_device_matrices(&mut self, matrices: &ConstraintMatrices<B::ArkScalarField>) -> bool {
-        if !spmv::available() || T::single_device_vec(&mut self.eval_a).is_none() {
+        if !on_cuda_device() || T::single_device_vec(&mut self.eval_a).is_none() {
             return false;
         }
         let source = matrices_source(matrices);

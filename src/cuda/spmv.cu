@@ -104,26 +104,60 @@ __device__ __forceinline__ Fe add_mod(const Fe& a, const Fe& b, const FieldParam
   return Fe{{t[0], t[1], t[2], t[3]}};
 }
 
-// out[row] = sum_k coeffs[k] * z[cols[k]] over row_ptr[row]..row_ptr[row + 1], where the
-// assignment z is the public inputs followed by the witness.
-extern "C" __global__ void spmv_kernel(
+// out[row] = sum_k table[coeff_idx[k]] * z[cols[k]] for the rows in `row_list`, z being the
+// public inputs followed by the witness, L lanes per row.
+template <int L>
+__device__ __forceinline__ void spmv_rows(
+  const uint32_t* __restrict__ row_list,
+  uint32_t num_rows,
   const uint32_t* __restrict__ row_ptr,
   const uint32_t* __restrict__ cols,
-  const Fe* __restrict__ coeffs,
+  const uint32_t* __restrict__ coeff_idx,
+  const Fe* __restrict__ table,
   const Fe* __restrict__ public_inputs,
   uint32_t num_public,
   const Fe* __restrict__ witness,
-  uint32_t rows,
   Fe* __restrict__ out,
-  FieldParams f)
+  const FieldParams& f)
 {
-  uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= rows) return;
+  const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t i = gid / L;
+  const uint32_t lane = gid % L;
+  const uint32_t row = i < num_rows ? row_list[i] : 0;
   Fe acc = {{0, 0, 0, 0}};
-  for (uint32_t k = row_ptr[row]; k < row_ptr[row + 1]; k++) {
-    uint32_t col = cols[k];
-    Fe v = col < num_public ? public_inputs[col] : witness[col - num_public];
-    acc = add_mod(acc, mont_mul(v, coeffs[k], f), f);
+  if (i < num_rows) {
+    const uint32_t end = row_ptr[row + 1];
+    for (uint32_t k = row_ptr[row] + lane; k < end; k += L) {
+      const uint32_t col = cols[k];
+      const Fe v = col < num_public ? public_inputs[col] : witness[col - num_public];
+      acc = add_mod(acc, mont_mul(v, table[coeff_idx[k]], f), f);
+    }
   }
-  out[row] = acc;
+#pragma unroll
+  for (int offset = L / 2; offset > 0; offset /= 2) {
+    Fe other;
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+      other.l[j] = __shfl_down_sync(0xffffffff, acc.l[j], offset, L);
+    acc = add_mod(acc, other, f);
+  }
+  if (lane == 0 && i < num_rows) out[row] = acc;
 }
+
+#define SPMV_KERNEL(L)                                                                             \
+  extern "C" __global__ void spmv_l##L(                                                            \
+    const uint32_t* __restrict__ row_list, uint32_t num_rows, const uint32_t* __restrict__ row_ptr, \
+    const uint32_t* __restrict__ cols, const uint32_t* __restrict__ coeff_idx,                     \
+    const Fe* __restrict__ table, const Fe* __restrict__ public_inputs, uint32_t num_public,       \
+    const Fe* __restrict__ witness, Fe* __restrict__ out, FieldParams f)                           \
+  {                                                                                                \
+    spmv_rows<L>(                                                                                  \
+      row_list, num_rows, row_ptr, cols, coeff_idx, table, public_inputs, num_public, witness, out, f); \
+  }
+
+SPMV_KERNEL(1)
+SPMV_KERNEL(2)
+SPMV_KERNEL(4)
+SPMV_KERNEL(8)
+SPMV_KERNEL(16)
+SPMV_KERNEL(32)
