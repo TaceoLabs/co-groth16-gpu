@@ -1,6 +1,7 @@
 //! A Groth16 proof protocol that uses a collaborative MPC protocol to generate the proof.
-use crate::cuda::retain_freed_device_memory;
-use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, msm_into};
+use crate::cuda::{Event, on_cuda_device, retain_freed_device_memory};
+use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, msm_into, msm_window};
+use crate::msm::{self as device_msm, Group, MsmScratch, MsmSort};
 use ark_bn254::Bn254;
 use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
@@ -80,6 +81,40 @@ struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScala
     h_result: DeviceVec<Projective<B::IcicleG1>>,
     /// The `A` and `B` matrices on the device, if the constraints are evaluated there.
     device_matrices: Option<DeviceMatrices<B::IcicleScalarField>>,
+    /// The device MSMs, if the kernels cover the key; Icicle's otherwise.
+    device_msms: Option<DeviceMsms<B>>,
+}
+
+struct DeviceMsms<B: ArkIcicleBridge> {
+    /// Shared by the `a`, `b_g1`, `l` and `b_g2` MSMs.
+    witness: MsmSort,
+    h: MsmSort,
+    g1: MsmScratch<Projective<B::IcicleG1>>,
+    g2: MsmScratch<Projective<B::IcicleG2>>,
+    h_scratch: MsmScratch<Projective<B::IcicleG1>>,
+    /// Orders the `b_g2` MSM after the sort on the G1 stream.
+    sorted: Event,
+}
+
+impl<B: ArkIcicleBridge> DeviceMsms<B> {
+    fn new(key: &ProvingKey<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>) -> Option<Self> {
+        // G1 and G2 share the sort.
+        if !on_cuda_device() || PRECOMPUTE_FACTOR_G1 != PRECOMPUTE_FACTOR_G2 {
+            return None;
+        }
+        let pf = PRECOMPUTE_FACTOR_G1 as usize;
+        let sort = |n| MsmSort::new(n, msm_window(n) as u32, pf as u32);
+        let witness = sort(key.num_instance_variables - 1 + key.num_witness_variables)?;
+        let h = sort(key.h_query.len() / pf)?;
+        Some(Self {
+            g1: MsmScratch::new(&witness, Group::G1, G1_BATCH_SIZE),
+            g2: MsmScratch::new(&witness, Group::G2, 1),
+            h_scratch: MsmScratch::new(&h, Group::G1, 1),
+            witness,
+            h,
+            sorted: Event::new(),
+        })
+    }
 }
 
 /// The number of MSMs in the G1 batch, see [`ProvingKey::g1_batch_bases`].
@@ -195,6 +230,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             g2_result: DeviceVec::device_malloc(1).expect("Failed to allocate MSM result"),
             h_result: DeviceVec::device_malloc(1).expect("Failed to allocate MSM result"),
             device_matrices: None,
+            device_msms: DeviceMsms::new(&prepared_key),
             prepared_key,
         }
     }
@@ -202,8 +238,8 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
     /// Execute the Groth16 prover using the internal MPC driver. `U` is the CPU-side driver
     /// matching `T`.
     ///
-    /// After uploading the witness, the MSMs that only depend on it run on a second thread
-    /// (Icicle's MSM calls return only once their bucket sort is done) while this one evaluates
+    /// After uploading the witness, the MSMs that only depend on it run (Icicle's on a second
+    /// thread: its MSM calls return only once their bucket sort is done) while this one evaluates
     /// the constraints and runs the reduction. Icicle's streams are blocking streams, so while
     /// the MSMs run nothing here may use the legacy default stream (synchronous copies,
     /// memsets, allocations or frees): it would wait for them.
@@ -248,6 +284,7 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             g2_result,
             h_result,
             device_matrices,
+            device_msms,
         } = self;
         let key = prepared_key.as_ref();
         let streams = &*streams;
@@ -256,23 +293,47 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         let pub_len = public_inputs.len() - 1;
 
         std::thread::scope(|s| -> eyre::Result<()> {
-            let msms = s.spawn(on_device(&device, || {
-                // The `a`, `b_g1` and `l` MSMs as one batch, and `b_g2` on another stream.
-                msm_into(
+            // The `a`, `b_g1` and `l` MSMs as one batch, and `b_g2` on another stream.
+            let msms = if let Some(m) = device_msms.as_mut() {
+                m.witness.sort(&msm_scalars[..msm_size], &streams.g1);
+                m.sorted.order(&streams.g1, &streams.g2);
+                device_msm::msm(
+                    Group::G1,
+                    &m.witness,
                     &key.g1_batch_bases,
-                    msm_scalars,
+                    msm_size * PRECOMPUTE_FACTOR_G1 as usize,
+                    &mut m.g1,
                     g1_results,
                     &streams.g1,
-                    PRECOMPUTE_FACTOR_G1,
                 );
-                msm_into(
+                device_msm::msm(
+                    Group::G2,
+                    &m.witness,
                     &key.b_g2_query,
-                    &msm_scalars[..msm_size],
+                    0,
+                    &mut m.g2,
                     g2_result,
                     &streams.g2,
-                    PRECOMPUTE_FACTOR_G2,
                 );
-            }));
+                None
+            } else {
+                Some(s.spawn(on_device(&device, || {
+                    msm_into(
+                        &key.g1_batch_bases,
+                        msm_scalars,
+                        g1_results,
+                        &streams.g1,
+                        PRECOMPUTE_FACTOR_G1,
+                    );
+                    msm_into(
+                        &key.b_g2_query,
+                        &msm_scalars[..msm_size],
+                        g2_result,
+                        &streams.g2,
+                        PRECOMPUTE_FACTOR_G2,
+                    );
+                })))
+            };
 
             let stream = &streams.eval;
             if evaluate_on_device {
@@ -340,16 +401,31 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                 "Witness map computation took {} ms",
                 timer.elapsed().as_millis()
             );
-            msm_into(
-                &key.h_query,
-                &scratch.h,
-                h_result,
-                &streams.h,
-                PRECOMPUTE_FACTOR_G1,
-            );
+            if let Some(m) = device_msms.as_mut() {
+                m.h.sort(&scratch.h, &streams.h);
+                device_msm::msm(
+                    Group::G1,
+                    &m.h,
+                    &key.h_query,
+                    0,
+                    &mut m.h_scratch,
+                    h_result,
+                    &streams.h,
+                );
+            } else {
+                msm_into(
+                    &key.h_query,
+                    &scratch.h,
+                    h_result,
+                    &streams.h,
+                    PRECOMPUTE_FACTOR_G1,
+                );
+            }
 
-            msms.join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if let Some(msms) = msms {
+                msms.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            }
             Ok(())
         })?;
 

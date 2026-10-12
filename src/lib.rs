@@ -6,6 +6,7 @@ mod cuda;
 mod gpu_utils;
 /// This module contains the Groth16 prover trait
 pub mod mpc;
+mod msm;
 mod spmv;
 mod utils;
 use icicle_runtime::runtime;

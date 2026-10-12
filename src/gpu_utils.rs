@@ -26,7 +26,7 @@ pub const LARGE_BUCKET_FACTOR: i32 = 5;
 /// For 2^16 points, a window of 16 with a precompute factor of 16 is about 3x faster than
 /// the default on an A40. Above 2^18 points, a window of 17 is about 7% faster than 16 on an
 /// RTX PRO 4500 Blackwell, while 18 can be pathologically slow for some sizes.
-fn msm_window(msm_size: usize) -> i32 {
+pub(crate) fn msm_window(msm_size: usize) -> i32 {
     if msm_size > 1 << 18 {
         17
     } else {
@@ -51,7 +51,7 @@ macro_rules! rayon_join_5 {
 use crate::bridges::{ArkIcicleBridge, ark_to_icicle_affine, ark_to_icicle_scalar};
 use crate::utils::root_of_unity_for_groth16;
 
-fn upload_points_async<C: Curve + MSM<C>>(
+pub(crate) fn upload_points_async<C: Curve + MSM<C>>(
     points: &[Affine<C>],
     msm_size: usize,
     stream: &IcicleStream,
@@ -189,7 +189,6 @@ pub struct ProvingKey<
     pub(crate) num_instance_variables: usize,
     pub(crate) num_witness_variables: usize,
 }
-
 
 pub struct ProofStreams {
     pub g1: IcicleStream,
