@@ -190,9 +190,12 @@ pub struct ProvingKey<
     pub(crate) num_witness_variables: usize,
 }
 
+
 pub struct ProofStreams {
     pub g1: IcicleStream,
     pub g2: IcicleStream,
+    pub h: IcicleStream,
+    pub eval: IcicleStream,
 }
 
 impl ProofStreams {
@@ -200,6 +203,8 @@ impl ProofStreams {
         Self {
             g1: IcicleStream::create().unwrap(),
             g2: IcicleStream::create().unwrap(),
+            h: IcicleStream::create().unwrap(),
+            eval: IcicleStream::create().unwrap(),
         }
     }
 }
@@ -208,6 +213,8 @@ impl Drop for ProofStreams {
     fn drop(&mut self) {
         let _ = self.g1.destroy();
         let _ = self.g2.destroy();
+        let _ = self.h.destroy();
+        let _ = self.eval.destroy();
     }
 }
 

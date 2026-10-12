@@ -55,31 +55,32 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
         a.a
     }
 
-    fn promote_to_trivial_shares(
+    fn write_trivial_shares_into(
         id: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
-    ) -> Self::DeviceShares {
-        let mut a = DeviceVec::device_malloc(public_values.len())
-            .expect("Failed to allocate device vector");
-        let mut b = DeviceVec::device_malloc(public_values.len())
-            .expect("Failed to allocate device vector");
+        dst: &mut Self::DeviceShares,
+        start: usize,
+        stream: &IcicleStream,
+    ) {
+        let len = public_values.len();
+        let range = start..start + len;
+        let a = dst.a.index_mut(range.clone());
+        let b = dst.b.index_mut(range);
 
         match id {
             PartyID::ID0 => {
-                a.copy(public_values).unwrap();
-                b.memset(0, public_values.len()).unwrap();
+                a.copy_async(public_values, stream).unwrap();
+                b.memset_async(0, len, stream).unwrap();
             }
             PartyID::ID1 => {
-                a.memset(0, public_values.len()).unwrap();
-                b.copy(public_values).unwrap();
+                a.memset_async(0, len, stream).unwrap();
+                b.copy_async(public_values, stream).unwrap();
             }
             PartyID::ID2 => {
-                a.memset(0, public_values.len()).unwrap();
-                b.memset(0, public_values.len()).unwrap();
+                a.memset_async(0, len, stream).unwrap();
+                b.memset_async(0, len, stream).unwrap();
             }
         }
-
-        Self::DeviceShares { a, b }
     }
 
     fn distribute_powers_and_mul_by_const(
@@ -117,16 +118,6 @@ impl<F: FieldImpl<Config: VecOps<F> + NTT<F, F>> + Arithmetic + MontgomeryConver
     fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
         ifft_inplace(&mut input.a, stream, coset_gen);
         ifft_inplace(&mut input.b, stream, coset_gen);
-    }
-
-    fn copy_to_device_shares(
-        src: &Self::DeviceShares,
-        dst: &mut Self::DeviceShares,
-        start: usize,
-        end: usize,
-    ) {
-        dst.a.index_mut(start..end).copy(&src.a).unwrap();
-        dst.b.index_mut(start..end).copy(&src.b).unwrap();
     }
 
     fn alloc_device_shares(len: usize) -> Self::DeviceShares {

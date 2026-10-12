@@ -4,7 +4,6 @@ use icicle_runtime::{
     memory::{DeviceSlice, DeviceVec, HostSlice},
     stream::IcicleStream,
 };
-use mpc_core::MpcState;
 use std::cell::RefCell;
 use tracing::instrument;
 
@@ -78,7 +77,6 @@ pub trait R1CSToQAP {
     /// Computes a QAP witness corresponding to the R1CS witness defined by `private_witness`, using the provided `ConstraintMatrices`.
     /// The provided `driver` is used to perform the necessary operations on the secret-shared witness.
     /// The result is left in `scratch.h`; `scratch` buffers are reused across calls.
-    #[expect(clippy::too_many_arguments)]
     fn witness_map_from_r1cs_eval<
         B: ArkIcicleBridge,
         T: CircomGroth16Prover<B::IcicleScalarField>,
@@ -87,9 +85,7 @@ pub trait R1CSToQAP {
         eval_a: &mut T::DeviceShares,
         eval_b: &mut T::DeviceShares,
         eval_c: Option<&mut DeviceVec<B::IcicleScalarField>>,
-        public_inputs: &DeviceSlice<B::IcicleScalarField>,
         roots_to_power_domain: &DeviceSlice<B::IcicleScalarField>,
-        num_constraints: usize,
         domain_size: usize,
         scratch: &mut ReductionScratch<B::IcicleScalarField>,
     ) -> Result<()>;
@@ -116,19 +112,11 @@ impl R1CSToQAP for CircomReduction {
         eval_a: &mut T::DeviceShares,
         eval_b: &mut T::DeviceShares,
         eval_c: Option<&mut DeviceVec<B::IcicleScalarField>>,
-        public_inputs: &DeviceSlice<B::IcicleScalarField>,
         roots_to_power_domain: &DeviceSlice<B::IcicleScalarField>,
-        num_constraints: usize,
-        domain_size: usize,
+        _domain_size: usize,
         scratch: &mut ReductionScratch<B::IcicleScalarField>,
     ) -> Result<()> {
         assert!(eval_c.is_none());
-
-        let id = state.id();
-
-        // Computation of a
-        let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
-        T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
 
         REDUCTION_STREAMS.with(|streams| {
             let mut streams = streams.borrow_mut();
@@ -198,9 +186,7 @@ impl R1CSToQAP for LibSnarkReduction {
         eval_a: &mut T::DeviceShares,
         eval_b: &mut T::DeviceShares,
         eval_c: Option<&mut DeviceVec<B::IcicleScalarField>>,
-        public_inputs: &DeviceSlice<B::IcicleScalarField>,
         _: &DeviceSlice<B::IcicleScalarField>,
-        num_constraints: usize,
         domain_size: usize,
         scratch: &mut ReductionScratch<B::IcicleScalarField>,
     ) -> Result<()> {
@@ -208,12 +194,7 @@ impl R1CSToQAP for LibSnarkReduction {
 
         let c = eval_c.unwrap();
 
-        let id = state.id();
         let coset_gen = Some(ark_to_icicle_scalar(B::ArkScalarField::GENERATOR));
-
-        // Computation of a
-        let promoted_public = T::promote_to_trivial_shares(id, public_inputs);
-        T::copy_to_device_shares(&promoted_public, eval_a, num_constraints, domain_size);
 
         // TODO
         let vanishing_polynomial_over_coset =

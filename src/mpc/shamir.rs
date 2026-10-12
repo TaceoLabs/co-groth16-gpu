@@ -81,14 +81,16 @@ where
         *a
     }
 
-    fn promote_to_trivial_shares(
+    fn write_trivial_shares_into(
         _: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
-    ) -> Self::DeviceShares {
-        let mut result = DeviceVec::device_malloc(public_values.len())
-            .expect("Failed to allocate device vector");
-        result.copy(public_values).unwrap();
-        result
+        dst: &mut Self::DeviceShares,
+        start: usize,
+        stream: &IcicleStream,
+    ) {
+        dst.index_mut(start..start + public_values.len())
+            .copy_async(public_values, stream)
+            .expect("Failed to write trivial shares");
     }
 
     fn distribute_powers_and_mul_by_const(
@@ -119,15 +121,6 @@ where
 
     fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>) {
         ifft_inplace(input, stream, coset_gen);
-    }
-
-    fn copy_to_device_shares(
-        src: &Self::DeviceShares,
-        dst: &mut Self::DeviceShares,
-        start: usize,
-        end: usize,
-    ) {
-        dst.index_mut(start..end).copy(src).unwrap();
     }
 
     fn alloc_device_shares(len: usize) -> Self::DeviceShares {

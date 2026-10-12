@@ -38,11 +38,15 @@ pub trait CircomGroth16Prover<
     /// Internal state of used MPC protocol
     type State: MpcState + Send;
 
-    /// Elementwise transformation of a vector of public values into a vector of shared values: \[a_i\] = a_i.
-    fn promote_to_trivial_shares(
+    /// Writes the trivial sharing of the public `public_values` into
+    /// `dst[start..start + public_values.len()]` on `stream`: \[a_i\] = a_i.
+    fn write_trivial_shares_into(
         id: <Self::State as MpcState>::PartyID,
         public_values: &DeviceSlice<F>,
-    ) -> Self::DeviceShares;
+        dst: &mut Self::DeviceShares,
+        start: usize,
+        stream: &IcicleStream,
+    );
 
     /// Computes the \[coeffs_i\] *= c * g^i for the coefficients in 0 <= i < coeff.len()
     fn distribute_powers_and_mul_by_const(
@@ -87,15 +91,6 @@ pub trait CircomGroth16Prover<
 
     /// Performs the Inverse Fast Fourier Transform (IFFT) in place.
     fn ifft_in_place(input: &mut Self::DeviceShares, stream: &IcicleStream, coset_gen: Option<F>);
-
-    /// Copies a slice of device shares to another device shares vector,
-    /// starting and ending at the specified indices.
-    fn copy_to_device_shares(
-        src: &Self::DeviceShares,
-        dst: &mut Self::DeviceShares,
-        start: usize,
-        end: usize,
-    );
 
     // ICICLE <-> ARK functions
 

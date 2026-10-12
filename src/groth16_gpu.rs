@@ -6,6 +6,7 @@ use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
 use icicle_core::curve::{Affine, Curve, Projective};
+use icicle_runtime::Device;
 use icicle_runtime::memory::{DeviceSlice, DeviceVec, HostOrDeviceSlice, HostSlice};
 use mpc_core::MpcState;
 use mpc_core::protocols::rep3::conversion::A2BType;
@@ -73,15 +74,25 @@ struct CoGroth16Icicle<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScala
     /// `public_inputs[1..] ++ witness` per MSM of the batch, since Icicle cannot share the
     /// scalars within a batch. The first copy also serves the `b_g2` MSM.
     msm_scalars: DeviceVec<B::IcicleScalarField>,
-    /// The MSM results: the G1 batch (`a`, `b_g1`, `l`), then `h`.
+    /// The MSM results: the G1 batch (`a`, `b_g1`, `l`), `b_g2` and `h`.
     g1_results: DeviceVec<Projective<B::IcicleG1>>,
     g2_result: DeviceVec<Projective<B::IcicleG2>>,
+    h_result: DeviceVec<Projective<B::IcicleG1>>,
     /// The `A` and `B` matrices on the device, if the constraints are evaluated there.
     device_matrices: Option<DeviceMatrices<B::IcicleScalarField>>,
 }
 
 /// The number of MSMs in the G1 batch, see [`ProvingKey::g1_batch_bases`].
 const G1_BATCH_SIZE: usize = 3;
+
+/// Wraps `f` to run on `device`; the active Icicle device is thread-local.
+fn on_device<R, F: FnOnce() -> R + Send>(device: &Device, f: F) -> impl FnOnce() -> R + Send {
+    let device = device.clone();
+    move || {
+        icicle_runtime::set_device(&device).expect("Failed to set device");
+        f()
+    }
+}
 
 /// `slice.split_at_mut(mid)` for device memory.
 fn split_device_slice_mut<T>(
@@ -179,17 +190,23 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
                     * (prepared_key.num_instance_variables - 1
                         + prepared_key.num_witness_variables),
             ),
-            g1_results: DeviceVec::device_malloc(G1_BATCH_SIZE + 1)
+            g1_results: DeviceVec::device_malloc(G1_BATCH_SIZE)
                 .expect("Failed to allocate MSM results"),
             g2_result: DeviceVec::device_malloc(1).expect("Failed to allocate MSM result"),
+            h_result: DeviceVec::device_malloc(1).expect("Failed to allocate MSM result"),
             device_matrices: None,
             prepared_key,
         }
     }
 
-    /// Execute the Groth16 prover using the internal MPC driver: evaluates the constraints
-    /// on the host, uploads the witness-dependent inputs into the pre-allocated device
-    /// buffers, and creates the proof. `U` is the CPU-side driver matching `T`.
+    /// Execute the Groth16 prover using the internal MPC driver. `U` is the CPU-side driver
+    /// matching `T`.
+    ///
+    /// After uploading the witness, the MSMs that only depend on it run on a second thread
+    /// (Icicle's MSM calls return only once their bucket sort is done) while this one evaluates
+    /// the constraints and runs the reduction. Icicle's streams are blocking streams, so while
+    /// the MSMs run nothing here may use the legacy default stream (synchronous copies,
+    /// memsets, allocations or frees): it would wait for them.
     fn prove<
         N: Network,
         R: R1CSToQAP,
@@ -203,75 +220,141 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         private_witness: &[U::ArithmeticShare],
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
         let setup_timer = std::time::Instant::now();
-        let adds_public = T::adds_public_values(state.id());
-        let id = state.id();
+        let t_id = state.id();
+        let adds_public = T::adds_public_values(t_id);
         // SAFETY: matching GPU/CPU driver pairs use the same PartyID type
         let id = unsafe {
-            transmute::<&<T::State as MpcState>::PartyID, &<U::State as MpcState>::PartyID>(&id)
+            transmute::<&<T::State as MpcState>::PartyID, &<U::State as MpcState>::PartyID>(&t_id)
         };
         let domain_size = self.prepared_key.domain_size;
+        let num_constraints = self.prepared_key.num_constraints;
 
-        // Uploaded first: `A` and `B` are evaluated from them when that happens on the device.
+        // Nothing runs on the device yet, so these may be synchronous.
         ark_scalars_to_device_into(public_inputs, &mut self.public_inputs);
         self.upload_msm_scalars::<U>(adds_public, public_inputs, private_witness);
-        let msm_size = self.msm_scalars.len() / G1_BATCH_SIZE;
+        let evaluate_on_device = self.update_device_matrices(matrices);
+        let device = icicle_runtime::get_active_device().expect("Failed to get active device");
+
+        let Self {
+            prepared_key,
+            scratch,
+            streams,
+            eval_a,
+            eval_b,
+            eval_c,
+            public_inputs: public_inputs_buf,
+            msm_scalars,
+            g1_results,
+            g2_result,
+            h_result,
+            device_matrices,
+        } = self;
+        let key = prepared_key.as_ref();
+        let streams = &*streams;
+        let msm_scalars = &*msm_scalars;
+        let msm_size = msm_scalars.len() / G1_BATCH_SIZE;
         let pub_len = public_inputs.len() - 1;
 
-        if self.update_device_matrices(matrices) {
-            let num_constraints = self.prepared_key.num_constraints;
-            let DeviceMatrices { a, b, .. } = self.device_matrices.as_ref().unwrap();
-            let stream = &self.streams.g1;
-            for (matrix, evals) in [(a, &mut self.eval_a), (b, &mut self.eval_b)] {
-                let evals = T::single_device_vec(evals).unwrap();
-                evals
-                    .index_mut(num_constraints..)
-                    .memset(0, domain_size - num_constraints)
-                    .expect("Failed to zero device buffer tail");
-                matrix.mul_vec(
-                    &self.public_inputs,
-                    &self.msm_scalars[pub_len..msm_size],
-                    &mut evals[..num_constraints],
-                    stream,
+        std::thread::scope(|s| -> eyre::Result<()> {
+            let msms = s.spawn(on_device(&device, || {
+                // The `a`, `b_g1` and `l` MSMs as one batch, and `b_g2` on another stream.
+                msm_into(
+                    &key.g1_batch_bases,
+                    msm_scalars,
+                    g1_results,
+                    &streams.g1,
+                    PRECOMPUTE_FACTOR_G1,
                 );
+                msm_into(
+                    &key.b_g2_query,
+                    &msm_scalars[..msm_size],
+                    g2_result,
+                    &streams.g2,
+                    PRECOMPUTE_FACTOR_G2,
+                );
+            }));
+
+            let stream = &streams.eval;
+            if evaluate_on_device {
+                let DeviceMatrices { a, b, .. } = device_matrices.as_ref().unwrap();
+                for (matrix, evals) in [(a, &mut *eval_a), (b, &mut *eval_b)] {
+                    let evals = T::single_device_vec(evals).unwrap();
+                    evals
+                        .index_mut(num_constraints..)
+                        .memset_async(0, domain_size - num_constraints, stream)
+                        .expect("Failed to zero device buffer tail");
+                    matrix.mul_vec(
+                        public_inputs_buf,
+                        &msm_scalars[pub_len..msm_size],
+                        &mut evals[..num_constraints],
+                        stream,
+                    );
+                }
+            } else {
+                // Synchronous uploads, so these wait for the MSMs (only with Rep3).
+                let eval = evaluate_constraint::<B::ArkPairing, U>(
+                    *id,
+                    domain_size,
+                    &matrices.a,
+                    public_inputs,
+                    private_witness,
+                );
+                T::shares_to_device_into::<B, U>(&eval, eval_a);
+                let eval = evaluate_constraint::<B::ArkPairing, U>(
+                    *id,
+                    domain_size,
+                    &matrices.b,
+                    public_inputs,
+                    private_witness,
+                );
+                T::shares_to_device_into::<B, U>(&eval, eval_b);
             }
+            if let Some(eval_c_buf) = eval_c.as_mut() {
+                let eval = evaluate_constraint_half_share::<B::ArkPairing, U>(
+                    *id,
+                    domain_size,
+                    &matrices.c,
+                    public_inputs,
+                    private_witness,
+                );
+                T::half_shares_to_device_into::<B, U>(&eval, eval_c_buf);
+            }
+            T::write_trivial_shares_into(t_id, public_inputs_buf, eval_a, num_constraints, stream);
             stream.synchronize().unwrap();
-        } else {
-            let eval_a = evaluate_constraint::<B::ArkPairing, U>(
-                *id,
-                domain_size,
-                &matrices.a,
-                public_inputs,
-                private_witness,
+            tracing::info!(
+                "Constraint evaluation + device upload took {} ms",
+                setup_timer.elapsed().as_millis()
             );
-            T::shares_to_device_into::<B, U>(&eval_a, &mut self.eval_a);
 
-            let eval_b = evaluate_constraint::<B::ArkPairing, U>(
-                *id,
+            let timer = std::time::Instant::now();
+            R::witness_map_from_r1cs_eval::<B, T>(
+                state,
+                eval_a,
+                eval_b,
+                eval_c.as_mut(),
+                &key.precomputed_roots,
                 domain_size,
-                &matrices.b,
-                public_inputs,
-                private_witness,
+                scratch,
+            )?;
+            tracing::info!(
+                "Witness map computation took {} ms",
+                timer.elapsed().as_millis()
             );
-            T::shares_to_device_into::<B, U>(&eval_b, &mut self.eval_b);
-        }
-
-        if let Some(eval_c_buf) = self.eval_c.as_mut() {
-            let eval_c = evaluate_constraint_half_share::<B::ArkPairing, U>(
-                *id,
-                domain_size,
-                &matrices.c,
-                public_inputs,
-                private_witness,
+            msm_into(
+                &key.h_query,
+                &scratch.h,
+                h_result,
+                &streams.h,
+                PRECOMPUTE_FACTOR_G1,
             );
-            T::half_shares_to_device_into::<B, U>(&eval_c, eval_c_buf);
-        }
 
-        tracing::info!(
-            "Constraint evaluation + device upload took {} ms",
-            setup_timer.elapsed().as_millis()
-        );
+            msms.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            Ok(())
+        })?;
 
-        self.prove_inner::<N, R>(net, state)
+        let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
+        self.finish_proof(net, state, r, s)
     }
 
     /// Writes `public_inputs[1..] ++ witness` into every copy in `self.msm_scalars`. A party that
@@ -323,34 +406,6 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         true
     }
 
-    /// Computes the QAP witness and creates the proof from the uploaded inputs.
-    fn prove_inner<N: Network, R: R1CSToQAP>(
-        &mut self,
-        net: &N,
-        state: &mut T::State,
-    ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
-        let timer_start = std::time::Instant::now();
-        R::witness_map_from_r1cs_eval::<B, T>(
-            state,
-            &mut self.eval_a,
-            &mut self.eval_b,
-            self.eval_c.as_mut(),
-            &self.public_inputs,
-            &self.prepared_key.precomputed_roots,
-            self.prepared_key.num_constraints,
-            self.prepared_key.domain_size,
-            &mut self.scratch,
-        )?;
-        tracing::info!(
-            "Witness map computation took {} ms",
-            timer_start.elapsed().as_millis()
-        );
-
-        let (r, s) = (T::rand::<_, B>(net, state)?, T::rand::<_, B>(net, state)?);
-
-        self.create_proof_with_assignment(net, state, r, s)
-    }
-
     /// `initial + first_query + vk_param + acc`, where the public `first_query` and `vk_param`
     /// are only added by the parties that may, and `acc` is an MSM result over scalars that
     /// already account for that (see [`Self::upload_msm_scalars`]).
@@ -370,15 +425,15 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         (res.to_projective() + acc.to_projective()).into()
     }
 
-    /// Creates the proof from the QAP witness left in `self.scratch.h` by the reduction.
-    fn create_proof_with_assignment<N: Network>(
+    /// Waits for the MSMs and assembles the proof. The first opening only needs the G1 batch,
+    /// so it happens while the `h` and `b_g2` MSMs may still be running.
+    fn finish_proof<N: Network>(
         &mut self,
         net: &N,
         state: &mut T::State,
         r: T::ArithmeticShare,
         s: T::ArithmeticShare,
     ) -> eyre::Result<Proof<B::IcicleScalarField, B::IcicleG1, B::IcicleG2>> {
-        let h = &self.scratch.h;
         let total_timer = std::time::Instant::now();
         let ProvingKey {
             vk,
@@ -387,136 +442,80 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
             a_query_first,
             b_g1_query_first,
             b_g2_query_first,
-            g1_batch_bases,
-            b_g2_query,
-            h_query,
             ..
         } = self.prepared_key.as_ref();
-
         let VerifyingKey {
             alpha_g1,
             beta_g2,
             delta_g2,
             ..
         } = vk;
-
         let delta_g1 = delta_g1.to_projective();
         let delta_g2 = delta_g2.to_projective();
-
         let id = state.id();
+        let streams = &self.streams;
 
-        let stream_g1 = &self.streams.g1;
-        let stream_g2 = &self.streams.g2;
-
-        let msm_timer = std::time::Instant::now();
-        let msm_size = self.msm_scalars.len() / G1_BATCH_SIZE;
-        // The `a`, `b_g1` and `l` MSMs as one batch, then `h`, and `b_g2` on the other stream.
-        msm_into(
-            g1_batch_bases,
-            &self.msm_scalars,
-            &mut self.g1_results[..G1_BATCH_SIZE],
-            stream_g1,
-            PRECOMPUTE_FACTOR_G1,
-        );
-        msm_into(
-            h_query,
-            h,
-            &mut self.g1_results[G1_BATCH_SIZE..],
-            stream_g1,
-            PRECOMPUTE_FACTOR_G1,
-        );
-        msm_into(
-            b_g2_query,
-            &self.msm_scalars[..msm_size],
-            &mut self.g2_result[..],
-            stream_g2,
-            PRECOMPUTE_FACTOR_G2,
-        );
-
-        stream_g1.synchronize().unwrap();
-        stream_g2.synchronize().unwrap();
-        tracing::info!(
-            "MSM + stream sync took {} ms",
-            msm_timer.elapsed().as_millis()
-        );
-
-        let coeff_timer = std::time::Instant::now();
-        let mut g1_results = [Projective::<B::IcicleG1>::zero(); G1_BATCH_SIZE + 1];
+        // The results are read on the MSMs' own streams: a synchronous copy would wait for all.
+        let mut g1_batch = [Projective::<B::IcicleG1>::zero(); G1_BATCH_SIZE];
         self.g1_results
-            .copy_to_host(HostSlice::from_mut_slice(&mut g1_results))
+            .copy_to_host_async(HostSlice::from_mut_slice(&mut g1_batch), &streams.g1)
             .expect("Failed to read back MSM results");
-        let mut g2_result = [Projective::<B::IcicleG2>::zero()];
-        self.g2_result
-            .copy_to_host(HostSlice::from_mut_slice(&mut g2_result))
-            .expect("Failed to read back MSM result");
-        let [acc_r_g1, acc_s_g1, l_acc, h_acc] = g1_results;
-        let [acc_s_g2] = g2_result;
+        streams.g1.synchronize().unwrap();
+        let [acc_r_g1, acc_s_g1, l_acc] = g1_batch;
+        tracing::info!(
+            "Waiting for the G1 MSMs took {} ms",
+            total_timer.elapsed().as_millis()
+        );
 
         let r_hs = T::to_half_share(&r);
-        let r_g1 = delta_g1 * r_hs;
-        let r_g1 = Self::calculate_coeff::<B::IcicleG1>(
+        let g_a = Self::calculate_coeff::<B::IcicleG1>(
             id,
-            r_g1.into(),
+            (delta_g1 * r_hs).into(),
             *a_query_first,
             *alpha_g1,
             acc_r_g1.into(),
         );
-
         // In original implementation this is skipped if r==0, however r is shared in our case
         let s_hs = T::to_half_share(&s);
-        let s_g1 = delta_g1 * s_hs;
-        let s_g1 = Self::calculate_coeff::<B::IcicleG1>(
+        let g1_b = Self::calculate_coeff::<B::IcicleG1>(
             id,
-            s_g1.into(),
+            (delta_g1 * s_hs).into(),
             *b_g1_query_first,
             *beta_g1,
             acc_s_g1.into(),
         );
-
-        let s_g2 = delta_g2 * s_hs;
-        let s_g2 = Self::calculate_coeff::<B::IcicleG2>(
-            id,
-            s_g2.into(),
-            *b_g2_query_first,
-            *beta_g2,
-            acc_s_g2.into(),
-        );
-
-        // Compute r * s
-        let rs = T::local_mul::<B>(&r, &s, state);
-        let r_s_delta_g1 = delta_g1 * rs;
-        tracing::info!(
-            "Coefficient assembly took {} ms",
-            coeff_timer.elapsed().as_millis()
-        );
-
-        let open_timer = std::time::Instant::now();
-        let g_a = r_g1;
-        let g1_b = s_g1;
-
         // Opening g1_b = B*G1 is safe: B is masked by the fresh uniform s, and its exponent is
         // published in the proof as b = B*G2 anyway. With B*G1 public, r*B*G1 is a local
         // scalar multiplication, so both values can be opened in a single round.
         let (g_a_opened, g1_b_opened) = T::open_two_half_points_g1::<_, B>(g_a, g1_b, net, state)
             .expect("Failed to open g_a and g1_b");
-        let r_g1_b: Projective<<B as ArkIcicleBridge>::IcicleG1> =
-            g1_b_opened.to_projective() * r_hs;
 
-        let s_g_a: Projective<<B as ArkIcicleBridge>::IcicleG1> = g_a_opened.to_projective() * s_hs;
+        let mut h_acc = [Projective::<B::IcicleG1>::zero()];
+        self.h_result
+            .copy_to_host_async(HostSlice::from_mut_slice(&mut h_acc), &streams.h)
+            .expect("Failed to read back MSM result");
+        let mut acc_s_g2 = [Projective::<B::IcicleG2>::zero()];
+        self.g2_result
+            .copy_to_host_async(HostSlice::from_mut_slice(&mut acc_s_g2), &streams.g2)
+            .expect("Failed to read back MSM result");
+        streams.h.synchronize().unwrap();
+        streams.g2.synchronize().unwrap();
 
-        let mut g_c = s_g_a;
-        g_c = g_c + r_g1_b;
-        g_c = g_c - r_s_delta_g1;
+        let g2_b = Self::calculate_coeff::<B::IcicleG2>(
+            id,
+            (delta_g2 * s_hs).into(),
+            *b_g2_query_first,
+            *beta_g2,
+            acc_s_g2[0].into(),
+        );
+        let rs = T::local_mul::<B>(&r, &s, state);
+        let mut g_c = g_a_opened.to_projective() * s_hs;
+        g_c = g_c + g1_b_opened.to_projective() * r_hs;
+        g_c = g_c - delta_g1 * rs;
         g_c = g_c + l_acc;
-        g_c = g_c + h_acc;
-
-        let g2_b = s_g2;
+        g_c = g_c + h_acc[0];
         let (g_c_opened, g2_b_opened) =
             T::open_two_half_points_g1g2::<_, B>(g_c.into(), g2_b, net, state)?;
-        tracing::info!(
-            "Point openings took {} ms",
-            open_timer.elapsed().as_millis()
-        );
         tracing::info!(
             "Proof with assignment took {} ms",
             total_timer.elapsed().as_millis()
