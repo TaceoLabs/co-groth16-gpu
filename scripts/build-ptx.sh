@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ICICLE_SRC=${ICICLE_SRC:-$(ls -d ~/.cargo/git/checkouts/icicle-snark-*/bf00385/icicle | head -1)}
-for k in ${*:-spmv msm_sort msm_g1 msm_g2}; do
+for k in ${*:-spmv ntt msm_sort msm_g1 msm_g2}; do
   nvcc -ptx -O3 -arch=compute_75 -std=c++17 --expt-relaxed-constexpr \
     -I"$ICICLE_SRC/include" -I"$ICICLE_SRC/backend/cuda/include" -DCURVE_ID=1 -DFIELD_ID=1 \
     "src/cuda/$k.cu" -o "src/cuda/$k.ptx"

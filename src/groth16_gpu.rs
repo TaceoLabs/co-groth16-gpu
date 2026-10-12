@@ -3,6 +3,7 @@ use crate::cuda::{Event, on_cuda_device, retain_freed_device_memory};
 use crate::gpu_utils::{PRECOMPUTE_FACTOR_G1, PRECOMPUTE_FACTOR_G2, msm_into, msm_window};
 use crate::msm::{self as device_msm, Group, MsmScratch, MsmSort};
 use ark_bn254::Bn254;
+use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
 use co_circom_types::SharedWitness;
 use co_groth16::ConstraintMatrices;
 use eyre::{Context, Result};
@@ -25,8 +26,11 @@ use crate::mpc::CircomGroth16Prover;
 use crate::mpc::plain::PlainGroth16Driver;
 use crate::mpc::rep3::Rep3Groth16Driver;
 use crate::mpc::shamir::ShamirGroth16Driver;
+use crate::ntt::CosetNtt;
 use crate::spmv::{self, DeviceMatrix};
-use crate::utils::{evaluate_constraint, evaluate_constraint_half_share};
+use crate::utils::{
+    evaluate_constraint, evaluate_constraint_half_share, root_of_unity_for_groth16,
+};
 
 use reduction::ReductionScratch;
 pub use reduction::{CircomReduction, LibSnarkReduction, R1CSToQAP};
@@ -213,8 +217,16 @@ impl<B: ArkIcicleBridge, T: CircomGroth16Prover<B::IcicleScalarField>> CoGroth16
         retain_freed_device_memory();
         let alloc = |len| DeviceVec::device_malloc(len).expect("Failed to allocate device vector");
         let domain_size = prepared_key.domain_size;
+        let mut scratch = ReductionScratch::new(domain_size, requires_eval_c);
+        if !requires_eval_c && on_cuda_device() {
+            let log_n = domain_size.ilog2() as usize;
+            let mut domain =
+                GeneralEvaluationDomain::<B::ArkScalarField>::new(domain_size).unwrap();
+            let coset_gen = root_of_unity_for_groth16(log_n, &mut domain);
+            scratch.coset_ntt = CosetNtt::new(log_n as u32, coset_gen);
+        }
         Self {
-            scratch: ReductionScratch::new(domain_size, requires_eval_c),
+            scratch,
             streams: ProofStreams::new(),
             eval_a: T::alloc_device_shares(domain_size),
             eval_b: T::alloc_device_shares(domain_size),

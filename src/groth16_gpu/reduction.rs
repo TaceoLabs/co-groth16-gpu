@@ -11,6 +11,7 @@ use crate::{
     bridges::{ArkIcicleBridge, ark_to_icicle_scalar},
     gpu_utils,
     mpc::CircomGroth16Prover,
+    ntt::CosetNtt,
 };
 
 use ark_ff::{FftField, Field};
@@ -55,6 +56,8 @@ pub struct ReductionScratch<F> {
     ab: DeviceVec<F>,
     /// Holds the QAP witness `h` after [`R1CSToQAP::witness_map_from_r1cs_eval`].
     pub(crate) h: DeviceVec<F>,
+    /// The device witness map of [`CircomReduction`], if available.
+    pub(crate) coset_ntt: Option<CosetNtt<F>>,
 }
 
 impl<F> ReductionScratch<F> {
@@ -66,6 +69,7 @@ impl<F> ReductionScratch<F> {
             sub: requires_eval_c.then(alloc),
             ab: alloc(),
             h: alloc(),
+            coset_ntt: None,
         }
     }
 }
@@ -117,6 +121,19 @@ impl R1CSToQAP for CircomReduction {
         scratch: &mut ReductionScratch<B::IcicleScalarField>,
     ) -> Result<()> {
         assert!(eval_c.is_none());
+
+        // Shares of single field elements (Shamir, plain) multiply element-wise.
+        if let Some(ntt) = &scratch.coset_ntt
+            && let (Some(a), Some(b)) = (T::single_device_vec(eval_a), T::single_device_vec(eval_b))
+        {
+            let c = scratch.c.as_mut().expect("allocated for CircomReduction");
+            REDUCTION_STREAMS.with(|streams| {
+                let stream = &streams.borrow().a;
+                ntt.witness_map(a, b, c, &mut scratch.h, stream);
+                stream.synchronize().unwrap();
+            });
+            return Ok(());
+        }
 
         REDUCTION_STREAMS.with(|streams| {
             let mut streams = streams.borrow_mut();
