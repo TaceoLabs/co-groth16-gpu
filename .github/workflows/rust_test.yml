@@ -27,8 +27,8 @@ jobs:
     name: Test
     runs-on: gpu-runner
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - name: Install build dependencies
@@ -99,7 +99,7 @@ jobs:
       # linker then couldn't find those libraries — the actual files didn't
       # survive the cache round-trip intact. Keep caching the registry/git
       # checkouts (safe, pure source data) but not target/.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
           cache-targets: false
@@ -121,7 +121,7 @@ jobs:
           echo "rev=$(grep -A2 '^name = "icicle-bn254"' Cargo.lock | grep -oP '(?<=#)[0-9a-f]{40}')" >> "$GITHUB_OUTPUT"
       - name: Restore ICICLE backend cache
         id: icicle-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.icicle-backend
           key: icicle-backend-bn254-${{ steps.icicle-rev.outputs.rev }}
@@ -152,7 +152,7 @@ jobs:
           echo "ICICLE_BACKEND_INSTALL_DIR=$install_dir/lib/backend" >> "$GITHUB_ENV"
       - name: Save ICICLE backend cache
         if: steps.icicle-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.icicle-backend
           key: icicle-backend-bn254-${{ steps.icicle-rev.outputs.rev }}
