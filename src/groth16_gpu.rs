@@ -810,8 +810,10 @@ impl<P: ark_ec::pairing::Pairing, R: R1CSToQAP> ShamirCoGroth16Prover<P, R> {
             private_witness
         );
 
-        // we need 2 corr rand pairs for the two rand calls
-        let num_pairs = 2;
+        // we need 2 corr rand pairs for the two rand calls and 4 for masking the two
+        // openings of two degree-2t points each. Must match co-groth16's Shamir prover,
+        // since all parties run the preprocessing together.
+        let num_pairs = 6;
         let preprocessing =
             ShamirPreprocessing::new(self.num_parties, self.threshold, num_pairs, net)?;
         let mut state = ShamirState::from(preprocessing);

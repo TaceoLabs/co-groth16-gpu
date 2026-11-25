@@ -179,6 +179,9 @@ pub trait CircomGroth16Prover<
         state: &mut Self::State,
     ) -> eyre::Result<Vec<B::ArkScalarField>>;
 
+    /// Opens a vector of half shares (e.g. results of [`Self::local_mul_vec`]).
+    /// Implementations must re-randomize the shares before sending them, since half shares
+    /// stemming from local multiplications are not uniformly random and would leak the inputs.
     fn open_device_half_shares<N: Network, B: ArkIcicleBridge<IcicleScalarField = F>>(
         shares: &DeviceVec<F>,
         net: &N,
