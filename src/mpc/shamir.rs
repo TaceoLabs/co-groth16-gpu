@@ -279,6 +279,14 @@ where
 
         let state = cast_state::<Fr, B::ArkScalarField>(state);
 
+        // The shares must be masked with degree-2t sharings of zero, otherwise the opened
+        // shares reveal the product of the sharing polynomials and thus the inputs.
+        // Consumes one correlated randomness pair per element.
+        let host_a = host_a
+            .into_iter()
+            .map(|x| Ok(x + state.zero_share_2t(net)?))
+            .collect::<eyre::Result<Vec<_>>>()?;
+
         // Values passed through `local_mul_vec`/`local_mul` are degree-2t shares, so opening
         // them requires 2t+1 shares and the corresponding Lagrange coefficients, unlike
         // `open_device_shares` which opens ordinary degree-t shares.
